@@ -1,0 +1,75 @@
+Package: linux-headers-6.1.85-mlnx
+Source: linux-upstream
+Version: 6.1.85-mlnx-5
+Architecture: amd64
+Maintainer: johns <johns@debpxe.fun.thruhere.net>
+Installed-Size: 52548
+Filename: ./linux-headers-6.1.85-mlnx_6.1.85-mlnx-5_amd64.deb
+Size: 8944868
+MD5sum: 29979ba664d113bef566bbe9ca369b20
+SHA1: 1f09cba901ea21adb5401a37b8c2199001c403b2
+SHA256: 5a974209df7d1c238cb84f9ad1c731cd58c17e2c4daad68d166820074bc8b071
+Section: kernel
+Priority: optional
+Homepage: https://www.kernel.org/
+Description: Linux kernel headers for 6.1.85-mlnx on amd64
+ This package provides kernel header files for 6.1.85-mlnx on amd64
+ .
+ This is useful for people who need to build external modules
+
+Package: linux-image-6.1.85-mlnx
+Source: linux-upstream
+Version: 6.1.85-mlnx-5
+Architecture: amd64
+Maintainer: johns <johns@debpxe.fun.thruhere.net>
+Installed-Size: 414408
+Filename: ./linux-image-6.1.85-mlnx_6.1.85-mlnx-5_amd64.deb
+Size: 74806056
+MD5sum: 569c608c24aa5a64d9205684ad1f4dcc
+SHA1: 81ddc0da2cd83f8a1e7e1dcdefde81569bd9cd86
+SHA256: b317bb1b6a366948441f7e1fe44b6a62894eab46749c583123dbadcac5e00807
+Section: kernel
+Priority: optional
+Homepage: https://www.kernel.org/
+Description: Linux kernel, version 6.1.85-mlnx
+ This package contains the Linux kernel, modules and corresponding other
+ files, version: 6.1.85-mlnx.
+
+Package: linux-image-6.1.85-mlnx-dbg
+Source: linux-upstream
+Version: 6.1.85-mlnx-5
+Architecture: amd64
+Maintainer: johns <johns@debpxe.fun.thruhere.net>
+Installed-Size: 5451963
+Filename: ./linux-image-6.1.85-mlnx-dbg_6.1.85-mlnx-5_amd64.deb
+Size: 820159144
+MD5sum: 209ffe8eb97b59dffc3556a7cdab96a6
+SHA1: ce2d43463a0ff4674714016dd656b761645b6d8e
+SHA256: 88332b30f4a1a0b6ec86b032129f8b12aceca3ddb6e4522f6c973531b3b0975c
+Section: debug
+Priority: optional
+Homepage: https://www.kernel.org/
+Description: Linux kernel debugging symbols for 6.1.85-mlnx
+ This package will come in handy if you need to debug the kernel. It provides
+ all the necessary debug symbols for the kernel and its modules.
+
+Package: linux-libc-dev
+Source: linux-upstream
+Version: 6.1.85-mlnx-5
+Architecture: amd64
+Maintainer: johns <johns@debpxe.fun.thruhere.net>
+Installed-Size: 6624
+Provides: linux-kernel-headers
+Filename: ./linux-libc-dev_6.1.85-mlnx-5_amd64.deb
+Size: 1274628
+MD5sum: f7d2eef8678411d957480c20ac760836
+SHA1: 229e9d07b0cba983db17d2545bff3097e6b0f0b2
+SHA256: eccd713585b7d0ed02be674aa651e1f0284e4933a30402292e824f590317c93d
+Section: devel
+Priority: optional
+Multi-Arch: same
+Homepage: https://www.kernel.org/
+Description: Linux support headers for userspace development
+ This package provides userspaces headers from the Linux kernel.  These headers
+ are used by the installed headers for GNU glibc and other system libraries.
+

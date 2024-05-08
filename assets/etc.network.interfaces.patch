@@ -1,0 +1,15 @@
+--- /etc/network/interfaces	2024-04-03 14:47:12.445289568 -0600
++++ /etc/network/interfaces.org	2024-04-03 14:46:09.249269638 -0600
+@@ -8,10 +8,5 @@
+ iface lo inet loopback
+ 
+ # The primary network interface
+-allow-hotplug eth0
+-iface eth0 inet dhcp
+-
+-# The secondary network interface
+-allow-hotplug eth1
+-iface eth1 inet dhcp
+-
++allow-hotplug enp0s2
++iface enp0s2 inet dhcp
