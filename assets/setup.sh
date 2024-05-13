@@ -8,8 +8,14 @@ cp tm /usr/bin
 chmod +x /usr/bin/tm
 chmod +x /usr/bin/termsize
 
+if [ ! -d /opt/packages ] ; then
+	mkdir /opt/packages
+	mv *.deb /opt/packages
+	mv Pack* Release* /opt/packages/
+fi
+
 cat << EOF >/etc/apt/sources.list
-deb [trusted=yes] file:/root/assets ./
+deb [trusted=yes] file:/opt/packages/ ./
 
 deb http://deb.debian.org/debian/ bookworm main non-free-firmware
 deb-src http://deb.debian.org/debian/ bookworm main non-free-firmware
@@ -25,19 +31,28 @@ EOF
 
 apt update
 apt install -y vim rsync wget ifupdown2 tmux patch smartmontools \
-               bridge-utils ethtool isc-dhcp-client 
+               briDge-utils ethtool isc-dhcp-client kitty-terminfo \
+	       sudo ntp ntp-doc ntpdate \
+               linux-headers-6.1.85-mlnx \
+               linux-image-6.1.85-mlnx
+
+apt-mark hold linux-image-6.1.85-mlnx linux-headers-6.1.85-mlnx
 
 patch /etc/default/grub <grub.serial.patch
-patch /etc/network/interfaces <etc.network.interfaces.patch
+grub-mkconfig -o /boot/grub/grub.cfg
 cp etc.udev.rules.d.10-local.rules /etc/udev/rules.d/10-local.rules
 patch /etc/modules <sensor.modules.patch
+cat << NET_EOF >/etc/network/interfaces
+# This file describes the network interfaces available on your system
+# and how to activate them. For more information, see interfaces(5).
 
-apt install -y \
-	linux-headers-6.1.85-mlnx_6.1.85-mlnx-5_amd64.deb \
-	linux-image-6.1.85-mlnx_6.1.85-mlnx-5_amd64.deb \
-	linux-libc-dev_6.1.85-mlnx-5_amd64.deb \
-	./linux-headers-*.deb ./linux-image-*mlnx_*.deb
+source /etc/network/interfaces.d/*
 
-echo "linux-headers-6.1.85-mlnx_6.1.85-mlnx-5_amd64.deb install" | dpkg --set-selections
-echo "linux-image-6.1.85-mlnx_6.1.85-mlnx-5_amd64.deb install" | dpkg --set-selections
-echo "linux-libc-dev_6.1.85-mlnx-5_amd64.deb install" | dpkg --set-selections
+# The loopback network interface
+auto lo
+iface lo inet loopback
+
+# The primary network interface
+allow-hotplug eth0
+iface eth0 inet dhcp
+NET_EOF

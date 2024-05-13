@@ -12,8 +12,7 @@ PASSWD='REDACTED-CREDENTIAL'
 
 BOOT_DRV_PARAMS="node-name=boot-drv,detect-zeroes=on,aio=io_uring,driver=raw,if=ide"
 NET_BRG_PARAMS="bridge,id=net0"
-#NET_BRG_PARAMS="bridge,id=br0"
-NET_DEV_PARAMS="e1000,netdev=net0"
+NET_DEV_PARAMS="e1000,netdev=net0,mac=52:54:00:12:34:56"
 UEFI_VARS_DRV="if=pflash,format=raw,file=${PWD}/OVMF_CODE.4m.fd"
 
 #bash_var=$(tmux split-window -P -F "#{pane_id}")
@@ -42,8 +41,8 @@ init_image_uefi() {
 		-device "${NET_DEV_PARAMS}" \
 		-drive "${UEFI_VARS_DRV}"   \
 		-cdrom "${OS_INSTALL_ISO}"  \
-		-append "interface=auto hostname=deb12mlnx locale=en_US console=tty0 console=ttyS0,115200n8d net.ifnames=0" \
-		-kernel assets/kernel/deb12.5/linux \
+		-append "interface=auto hostname=mlnx locale=en_US console=tty0 console=ttyS0,115200n8d net.ifnames=0" \
+		-kernel assets/kernel/deb12.5/vmlinuz \
 		-initrd assets/kernel/deb12.5/initrd.gz \
 		-boot menu=on -nographic
 }
@@ -96,13 +95,13 @@ run_image_bios() {
 		-drive  "${BOOT_DRV_PARAMS},file=${OS_DISK_IMG}" \
 		-netdev "${NET_BRG_PARAMS}" \
 		-device "${NET_DEV_PARAMS}" \
-		-boot menu=on -nographic
+		-boot menu=on
 }
-init_image_bios
+#init_image_bios
 #init_image_net_bios
 #run_image_bios
 #init_image_uefi
-#run_image_uefi
+run_image_uefi
 
 
 # Things to install:
