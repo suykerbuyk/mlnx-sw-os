@@ -1,0 +1,8 @@
+[NetDev]
+Name=mgmt
+Kind=bond
+
+[Bond]
+Mode=active-backup
+PrimaryReselectPolicy=always
+MIIMonitorSec=1s

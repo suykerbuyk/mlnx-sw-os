@@ -1,0 +1,7 @@
+[NetDev]
+Name=data
+Kind=bridge
+
+[Bridge]
+DefaultPVID=0
+VLANFiltering=false

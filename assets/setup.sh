@@ -30,9 +30,9 @@ deb-src http://deb.debian.org/debian/ bookworm-updates main non-free-firmware
 EOF
 
 apt update
-apt install -y vim rsync wget ifupdown2 tmux patch smartmontools \
-               briDge-utils ethtool isc-dhcp-client kitty-terminfo \
-	       sudo ntp ntp-doc ntpdate \
+apt install -y vim rsync wget tmux patch smartmontools \
+               bridge-utils ethtool isc-dhcp-client kitty-terminfo \
+               sudo ntp ntp-doc ntpdate polkitd pkexec systemd-resolved \
                linux-headers-6.1.85-mlnx \
                linux-image-6.1.85-mlnx
 
@@ -42,17 +42,10 @@ patch /etc/default/grub <grub.serial.patch
 grub-mkconfig -o /boot/grub/grub.cfg
 cp etc.udev.rules.d.10-local.rules /etc/udev/rules.d/10-local.rules
 patch /etc/modules <sensor.modules.patch
-cat << NET_EOF >/etc/network/interfaces
-# This file describes the network interfaces available on your system
-# and how to activate them. For more information, see interfaces(5).
+mv /etc/network/interfaces /etc/network/interfaces.save
+rsync -avr ./etc.systemd.network/ /etc/systemd/network/
+apt autoremove -y
+apt clean
 
-source /etc/network/interfaces.d/*
-
-# The loopback network interface
-auto lo
-iface lo inet loopback
-
-# The primary network interface
-allow-hotplug eth0
-iface eth0 inet dhcp
-NET_EOF
+systemctl enable systemd-networkd
+systemctl enable systemd-resolved

@@ -1,0 +1,5 @@
+[Match]
+Name=swp*
+
+[Network]
+Bridge=data
