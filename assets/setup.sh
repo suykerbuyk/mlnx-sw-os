@@ -30,9 +30,9 @@ deb-src http://deb.debian.org/debian/ bookworm-updates main non-free-firmware
 EOF
 
 apt update
-apt install -y vim rsync wget tmux patch smartmontools \
-               bridge-utils ethtool isc-dhcp-client kitty-terminfo \
-               sudo ntp ntp-doc ntpdate polkitd pkexec systemd-resolved \
+apt install -y vim rsync wget tmux patch smartmontools lm-sensors fancontrol \
+               bridge-utils ethtool isc-dhcp-client kitty-terminfo gdisk parted \
+               smbios-utils sudo ntp ntp-doc ntpdate polkitd pkexec systemd-resolved \
                linux-headers-6.1.85-mlnx \
                linux-image-6.1.85-mlnx
 
@@ -46,6 +46,9 @@ mv /etc/network/interfaces /etc/network/interfaces.save
 rsync -avr ./etc.systemd.network/ /etc/systemd/network/
 apt autoremove -y
 apt clean
+
+# Remove our local repo reference
+sed -i '/^[^#]/ s/\(^.*deb \[trusted.*$\)/#\ \1/' /etc/apt/sources.list
 
 systemctl enable systemd-networkd
 systemctl enable systemd-resolved

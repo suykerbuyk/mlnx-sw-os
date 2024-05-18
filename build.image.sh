@@ -128,3 +128,19 @@ run_image_uefi
 # SUBSYSTEM=="net", ACTION=="add", DRIVERS=="mlxsw_spectrum*", \
 #    NAME="sw$attr{phys_port_name}"
 
+##Resizing bios partitions 
+# ONE_MB="1048576"
+# ONE_GB="1073741824"
+# ONE_TB="1099511627776"
+# CAPACITY=$(lsblk --list -b /dev/sda | grep -E "sda " | awk '{print $4}')
+# CAPACITY_MB="$((CAPACITY/1024/1024))"
+#
+# Turn off swap:
+#   sed 's/^[^#]*swap/#&/' -i /etc/fstab
+#   swapoff -a
+# rm 5
+# rm 2
+#
+echo "Note: After removing and replacing the swap partition to resize the root partition,"
+echo "One must either assign the same UUID to new partition or regenerate initramfs"
+echo "See: https://www.debian.org/doc/manuals/debian-kernel-handbook/ch-initramfs.html"
