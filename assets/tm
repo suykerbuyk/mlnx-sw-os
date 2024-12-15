@@ -2,9 +2,11 @@
 # qdbus org.kde.konsole $KONSOLE_DBUS_SESSION setTitle 1 $(uname -n)
 #printf "\033]0;%s@%s\007" "${USER}" "$(hostname)"
 #cols=$(tput cols)
-if [ $(which hostnamectl &>/dev/null) ]; then
+
+HNAMECTL="$(which hostnamectl)"
+if [ -x "$(which hostnamectl)" ] ; then
 	HNAME=$(hostnamectl deployment)
-	if [ -z $HNAME ] ; then
+	if [ -z $HNAME ] || [ "X${HNAME}" = "X" ] ; then
 		HNAME=$(hostnamectl hostname)
 	fi
 else
