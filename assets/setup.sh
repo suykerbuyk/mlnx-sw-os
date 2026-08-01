@@ -1,8 +1,8 @@
 #!/bin/bash
 set -e
 cp tmux.conf /root/.tmux.conf
-cp tmux.conf /home/alt/.tmux.conf
-chown alt:alt /home/alt/.tmux.conf
+cp tmux.conf /home/johns/.tmux.conf
+chown johns:johns /home/johns/.tmux.conf
 cp termsize /usr/bin/
 cp tm /usr/bin
 chmod +x /usr/bin/tm

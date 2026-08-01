@@ -1,0 +1,26 @@
+# AI tooling — host-local, never committed to the project repo.
+# Unanchored so nested copies are caught too: vibe-palace drops a session
+# claim marker into whatever directory a shell happens to land in.
+CLAUDE.md
+AGENTS.md
+/commit.msg
+.claude/
+.grok/
+.vibe-palace/
+.vibe-palace.toml
+
+# Build artifacts. Huge and fully regenerable — the image builder's whole
+# point is that these are outputs, not inputs.
+*.img
+*.iso
+*.qcow2
+*.raw
+
+# Installer kernels/initrds extracted from Debian media. Re-extract them
+# rather than tracking them.
+assets/kernel/
+
+# Prototype-era prebuilt kernel packages. The DKMS package supersedes these;
+# keep only the small DKMS artifact under version control.
+mlnx-switch-packages/*
+!mlnx-switch-packages/dkms/

@@ -2,3 +2,8 @@
 *.xz filter=lfs diff=lfs merge=lfs -text
 linux filter=lfs diff=lfs merge=lfs -text
 initrd.gz filter=lfs diff=lfs merge=lfs -text
+
+# The DKMS package is ~330 KB and is the one binary we intentionally track
+# raw: routing it through LFS would add a fetch dependency for no benefit,
+# and it must remain clonable on hosts without git-lfs installed.
+mlnx-switch-packages/dkms/*.deb -filter -diff -merge -text

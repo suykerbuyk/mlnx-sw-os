@@ -1,5 +1,6 @@
 #!/bin/sh
-cp /usr/share/ovmf/x64/OVMF_VARS.fd /tmp/qemu-pxe-OVMF_VARS.fd
+#cp /usr/share/ovmf/x64/OVMF_VARS.fd /tmp/qemu-pxe-OVMF_VARS.fd
+cp /usr/share/edk2/x64/OVMF_VARS.4m.fd /tmp/qemu-pxe-OVMF_VARS.fd
 #qemu-kvm -cpu host -accel kvm \
 qemu-system-x86_64 \
 -machine q35,smm=on -global driver=cfi.pflash01,property=secure,value=on \
@@ -12,3 +13,4 @@ qemu-system-x86_64 \
 -nographic \
 -serial stdio -boot n $@
 
+#-drive file=/tmp/qemu-pxe-OVMF_VARS.fd,if=pflash,format=raw,unit=1 \

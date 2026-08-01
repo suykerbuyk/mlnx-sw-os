@@ -2,10 +2,11 @@
 
 LOCAL_IP="$(ip addr show br0 | grep '   inet ' | awk '{print $2}' | sed 's|/.*||g')"
 
-OS_DISK_BIOS_IMG="switch_boot_bios.img"
-OS_DISK_UEFI_IMG="switch_boot_uefi.img"
-#OS_INSTALL_ISO="/ark01/srv/os/linux/debian/iso/debian-12.5.0-amd64-STICK16GB-1.iso"
+OS_DISK_BIOS_IMG="deb12_image_builder_bios.img"
+OS_DISK_UEFI_IMG="deb12_image_builder_uefi.img"
 OS_INSTALL_ISO="/home/johns/code/debian/debian-12.8.0-amd64-STICK16GB-1.iso"
+OS_HOSTNAME='deb12builder'
+OS_DISK_IMG_SIZE_GB=32
 
 # The only non-root account is 'johns', with full sudo. No password is baked
 # into the image -- authentication is by SSH key (assets/id_ed25519.pub).
@@ -15,6 +16,10 @@ BOOT_DRV_PARAMS="node-name=boot-drv,detect-zeroes=on,aio=io_uring,driver=raw,if=
 NET_BRG_PARAMS="bridge,id=net0"
 NET_DEV_PARAMS="e1000,netdev=net0,mac=52:54:00:12:34:56"
 UEFI_VARS_DRV="if=pflash,format=raw,file=${PWD}/OVMF_CODE.4m.fd"
+
+#note to self - how to test if an image file has partitions:
+#  partx deb12_image_builder_bios.img &>/dev/null; echo $?
+# non zero ret code on fail.
 
 #bash_var=$(tmux split-window -P -F "#{pane_id}")
 
@@ -34,7 +39,7 @@ init_image_uefi() {
 	if [ ! -f ${OS_DISK_IMG} ] ; then
 		echo "Creating UEFI OS install image file"
 		truncate -s 0 ${OS_DISK_IMG}
-		dd if=/dev/zero of=${OS_DISK_IMG} bs=1G count=8 oflag=sync
+		dd if=/dev/zero of=${OS_DISK_IMG} bs=1G count=${OS_DISK_IMG_SIZE_GB} oflag=sync
 	fi
 	qemu-system-x86_64 -machine type=q35 -m 8G \
 		-drive "${BOOT_DRV_PARAMS},file=${OS_DISK_IMG}" \
@@ -42,9 +47,9 @@ init_image_uefi() {
 		-device "${NET_DEV_PARAMS}" \
 		-drive "${UEFI_VARS_DRV}"   \
 		-cdrom "${OS_INSTALL_ISO}"  \
-		-append "interface=auto hostname=mlnx locale=en_US console=tty0 console=ttyS0,115200n8d net.ifnames=0" \
-		-kernel assets/kernel/deb12.5/vmlinuz \
-		-initrd assets/kernel/deb12.5/initrd.gz \
+		-append "interface=auto hostname=${OS_HOSTNAME} locale=en_US console=tty0 console=ttyS0,115200n8d net.ifnames=0" \
+		-kernel assets/kernel/deb12.8/vmlinuz \
+		-initrd assets/kernel/deb12.8/initrd.gz \
 		-boot menu=on -nographic
 }
 init_image_bios() {
@@ -52,21 +57,24 @@ init_image_bios() {
 	if [ ! -f ${OS_DISK_IMG} ] ; then
 		echo "Creating BIOS install image file"
 		truncate -s 0 ${OS_DISK_IMG}
-		dd if=/dev/zero of=${OS_DISK_IMG} bs=1G count=8 oflag=sync
+		dd if=/dev/zero of=${OS_DISK_IMG} bs=1G count=${OS_DISK_IMG_SIZE_GB} oflag=sync
 	fi
 	qemu-system-x86_64 -machine type=q35 -m 8G \
 		-drive  "${BOOT_DRV_PARAMS},file=${OS_DISK_IMG}" \
 		-netdev "${NET_BRG_PARAMS}" \
 		-device "${NET_DEV_PARAMS}" \
+		-append "interface=auto hostname=${OS_HOSTNAME} locale=en_US console=tty0 console=ttyS0,115200n8d net.ifnames=0" \
+		-kernel assets/kernel/deb12.8/vmlinuz \
+		-initrd assets/kernel/deb12.8/initrd.gz \
 		-cdrom  "${OS_INSTALL_ISO}" \
-		-boot menu=on
+		-boot menu=on -nographic
 }
 init_image_net_bios() {
 	OS_DISK_IMG="${OS_DISK_BIOS_IMG}"
 	if [ ! -f ${OS_DISK_IMG} ] ; then
 		echo "Creating BIOS install image file"
 		truncate -s 0 ${OS_DISK_IMG}
-		dd if=/dev/zero of=${OS_DISK_IMG} bs=1G count=8 oflag=sync
+		dd if=/dev/zero of=${OS_DISK_IMG} bs=1G count=${OS_DISK_IMG_SIZE_GB} oflag=sync
 	fi
 	qemu-system-x86_64 -machine type=q35 -m 8G \
 		-drive  "${BOOT_DRV_PARAMS},file=${OS_DISK_IMG}" \
@@ -75,7 +83,7 @@ init_image_net_bios() {
 		-cdrom  "${OS_INSTALL_ISO}" \
 		-kernel assets/kernel/deb12.5/linux     \
 		-initrd assets/kernel/deb12.5/initrd.gz \
-		-append "auto=false DEBCONF_DEBUG=5 url=http://${LOCAL_IP}:8080/selections.txt checksum=d6b583e85d1617a43adfa3b0bbcf8501 interface=auto hostname=deb12mlnx locale=en_US console=tty0 console=ttyS0,115200n8d net.ifnames=0" \
+		-append "auto=false DEBCONF_DEBUG=5 url=http://${LOCAL_IP}:8080/selections.txt checksum=d6b583e85d1617a43adfa3b0bbcf8501 interface=auto hostname=${OS_HOSTNAME} locale=en_US console=tty0 console=ttyS0,115200n8d net.ifnames=0" \
 		-boot menu=on -nographic
 }
 
@@ -96,11 +104,11 @@ run_image_bios() {
 		-drive  "${BOOT_DRV_PARAMS},file=${OS_DISK_IMG}" \
 		-netdev "${NET_BRG_PARAMS}" \
 		-device "${NET_DEV_PARAMS}" \
-		-boot menu=on
+		-boot menu=on -nographic
 }
-init_image_bios
+#init_image_bios
 #init_image_net_bios
-#run_image_bios
+run_image_bios
 #init_image_uefi
 #run_image_uefi
 
