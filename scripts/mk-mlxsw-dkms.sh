@@ -109,11 +109,14 @@ done
 [ -r "$PARSER" ] || die "parser not found: $PARSER"
 
 # ---------------------------------------------------------------- resolution
-# Derive series from version when possible, then source from series.
+# Derive series from version when possible, then from the RUNNING KERNEL --
+# never from a hardcoded default. This script runs in the build VM and on the
+# switches, where the correct series is whatever that machine is running; a
+# baked-in "6.1" silently pointed a trixie guest at a bookworm source tree.
 if [ -z "$SERIES" ] && [ -n "$VER" ]; then
 	SERIES="${VER%.*}"
 fi
-[ -n "$SERIES" ] || SERIES="6.1"
+[ -n "$SERIES" ] || SERIES="$(uname -r | cut -d. -f1,2)"
 [ -n "$SRC" ] || SRC="/usr/src/linux-source-$SERIES"
 
 if [ -z "$MAKEFILE" ]; then

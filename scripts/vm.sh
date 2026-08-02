@@ -12,8 +12,10 @@
 # Debian-only bootstrapper: swapping to a rolling Arch base must not be a
 # rewrite.
 #
-# Usage: vm.sh {fetch|up|ssh|provision|probe|status|down|destroy}
+# Usage: vm.sh {fetch|up|ssh|provision|probe|audit|status|down|destroy}
 set -euo pipefail
+
+HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---------------------------------------------------------------- config
 DISTRO="${DISTRO:-debian}"
@@ -350,6 +352,16 @@ do_probe() {
 }
 
 # ---------------------------------------------------------------- lifecycle
+# ---------------------------------------------------------------- Phase 1
+# Pipe the audit in over ssh rather than installing it: the guest stays a
+# stock system, and the same script runs unmodified against a live switch.
+do_audit() {
+	vm_running || die "not running -- run: $0 up"
+	local a="$HERE/mlxsw-premise-audit.sh"
+	[ -r "$a" ] || die "audit script not found: $a"
+	ssh_vm 'sudo bash -s' < "$a"
+}
+
 do_status() {
 	if vm_running; then
 		printf 'running  pid=%s  ssh -i %s -p %s %s@127.0.0.1\n' \
@@ -390,11 +402,12 @@ up)        do_up ;;
 ssh)       shift; ssh_vm "$@" ;;
 provision) do_provision ;;
 probe)     do_probe ;;
+audit)     do_audit ;;
 status)    do_status ;;
 down)      do_down ;;
 destroy)   do_destroy ;;
 *)
 	sed -n '2,18p' "$0" | sed 's/^# \?//'
-	printf '\nUsage: %s {fetch|up|ssh|provision|probe|status|down|destroy}\n' "$0"
+	printf '\nUsage: %s {fetch|up|ssh|provision|probe|audit|status|down|destroy}\n' "$0"
 	exit 1 ;;
 esac
