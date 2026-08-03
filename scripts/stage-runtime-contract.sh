@@ -589,21 +589,20 @@ REQUIRED_IMAGE=(
 )
 
 # Operator preference. Nothing here is load-bearing.
-PREFERRED=(vim rsync wget tmux kitty-terminfo lm-sensors dmidecode)
-
-# 🔴 TODO(iter24): RESOLVE THIS NAME. The operator asked for "ipmiutils".
-# Trixie ships `ipmitool` (the ipmitool CLI) and `ipmiutil` (singular, a
-# different project); `ipmiutils` is NEITHER and will never resolve. This is an
-# OPEN QUESTION for the operator, not a defect in this stage, so it lives in
-# its own slot: it is probed and reported, never installed, and it can never
-# take the whole apt transaction down with it. Phase 2 runs
-# check_package_names() against the real archive and prints which candidates
-# exist; the operator then picks one and it moves into PREFERRED above.
 #
-# WHAT HAS TO BE DECIDED: which of {ipmitool, ipmiutil, neither} the fleet
-# actually wants for out-of-band management on SN2410/SN2700.
-PREFERRED_UNRESOLVED=(ipmiutils)
-PREFERRED_UNRESOLVED_CANDIDATES=(ipmitool ipmiutil)
+# `ipmiutil` is the operator's pick for out-of-band management, RESOLVED iter 13
+# and measured against the real trixie archive:
+#
+#     ipmitool   1.8.19-9   "utility for IPMI control with kernel driver or LAN"
+#     ipmiutil   3.2.1-1    "IPMI management utilities"
+#     ipmiutils  -- no stanza at all; the name does not exist
+#
+# ⚠ The two singular names are DIFFERENT PROJECTS, not spellings of each other,
+# and BOTH exist. The original request was "ipmiutils", which is neither. The
+# operator picked `ipmiutil`. Recorded because the pick was made on the stated
+# premise that `ipmitool` does not exist -- it does, and it is the more common
+# of the two -- so revisiting this is a preference change, not a bug fix.
+PREFERRED=(vim rsync wget tmux kitty-terminfo lm-sensors dmidecode ipmiutil)
 
 # Filled in by check_package_names(): the preference names this archive actually
 # has. Declared here so `set -u` cannot trip over it on any path.
@@ -1212,19 +1211,6 @@ check_package_names() {
 	done
 	[ "${#PREFERRED_OK[@]}" = "${#PREFERRED[@]}" ] && ok "every OPERATOR-PREFERENCE package name resolves (${#PREFERRED[@]} names)"
 
-	# The open question. Probed and REPORTED, never installed, never fatal.
-	for p in "${PREFERRED_UNRESOLVED[@]}"; do
-		if v="$(pkg_candidate "$p")"; then
-			inf "TODO(iter24): '$p' DOES resolve ($v) -- move it into PREFERRED"
-		else
-			inf "TODO(iter24): '$p' does not exist in this archive, as expected"
-		fi
-	done
-	for p in "${PREFERRED_UNRESOLVED_CANDIDATES[@]}"; do
-		if v="$(pkg_candidate "$p")"; then inf "TODO(iter24): candidate '$p' EXISTS ($v)"
-		else inf "TODO(iter24): candidate '$p' does not exist"; fi
-	done
-	inf "TODO(iter24): the operator must pick one of ${PREFERRED_UNRESOLVED_CANDIDATES[*]} (or neither) for out-of-band management"
 	return "$rc"
 }
 
@@ -1858,14 +1844,20 @@ do_selftest() {
 	printf '%s\n' "${PREFERRED[@]}" | list_has_none_of "${REQUIRED_BUILD[@]}" "${REQUIRED_IMAGE[@]}" \
 		&& ok "no operator preference is hiding inside the required sets" \
 		|| bad "a package appears in both a REQUIRED set and PREFERRED"
-	[ "${#PREFERRED_UNRESOLVED[@]}" -ge 1 ] && ok "the unresolved-name slot is populated (${PREFERRED_UNRESOLVED[*]})" \
-	                                        || bad "the unresolved-name slot is empty"
-	printf '%s\n' "${PREFERRED_UNRESOLVED[@]}" | list_has_none_of $(install_list) \
-		&& ok "the unresolved name is NOT in the install list (it can never fail the transaction)" \
-		|| bad "the unresolved name would be handed to apt"
-	if [ -n "$SELF_SRC" ] && grep -q 'TODO(iter24)' "$SELF_SRC"; then
-		ok "a TODO(iter24) marker names what has to be decided"
-	else bad "no TODO(iter24) marker for the unresolved package name"; fi
+	# RESOLVED iter 13. `ipmiutil` is the operator's pick and is now a plain
+	# preference; the nonexistent `ipmiutils` must never reappear anywhere.
+	install_list | list_has ipmiutil && ok "ipmiutil is in the install list (the operator's out-of-band pick)" \
+	                                 || bad "ipmiutil is missing from the install list"
+	printf 'ipmiutils\n' | list_has_none_of $(install_list) \
+		&& ok "the nonexistent name 'ipmiutils' is NOT in the install list" \
+		|| bad "'ipmiutils' would be handed to apt -- it does not exist and would fail the whole transaction"
+	# ⚠ NO SOURCE GREP HERE, deliberately. A `^[^#]*ipmiutils` guard flags its own
+	# must-fail fixture on the line above -- the same self-matching trap that
+	# retired the versioned-headers source grep. The outcome check IS the guard:
+	# what matters is that the name never reaches apt, not that it never appears.
+	install_list | list_has_none_of ipmiutils \
+		&& ok "no nonexistent ipmi name can reach apt (checked by outcome, not by source grep)" \
+		|| bad "a nonexistent ipmi name is in the install list"
 
 	# MUST FAIL -- synthetic lists that each break one rule
 	printf 'dkms\nlinux-headers-6.12.100+deb13-amd64\n' | list_has_no_versioned_headers \

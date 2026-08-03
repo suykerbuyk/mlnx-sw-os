@@ -451,7 +451,21 @@ do_strip() {
 	# and still rendering into /run/systemd/network -- .link files as well as
 	# .network, so an assertion that inspects only .network passes with live
 	# configuration in place. All four netplan packages, or none.
-	CANDIDATES="cloud-init netplan.io netplan-generator python3-netplan libnetplan1 cloud-initramfs-growroot"
+	#
+	# 🔴 cloud-guest-utils is purged BY NAME (operator ruling, iter 13), and the
+	# by-name part is the whole point. It ships IN THE BASE IMAGE -- this stage
+	# never installs it -- and it is MANUALLY marked, so purging cloud-init does
+	# NOT autoremove it. Measured on a pristine trixie guest:
+	#
+	#     cloud-guest-utils 0.33-1 install ok installed
+	#     Reverse Depends: cloud-init, cloud-utils
+	#
+	# Leaving it would ship a cloud-* package the image is defined as not
+	# carrying, and would leave the boot-test's "no cloud-init/netplan packages"
+	# assertion unable to see it. Its only content of interest was growpart, and
+	# growth is systemd-repart now, so nothing depends on it. Both reverse-deps
+	# are safe: cloud-init is in this very list, and cloud-utils is not installed.
+	CANDIDATES="cloud-init netplan.io netplan-generator python3-netplan libnetplan1 cloud-initramfs-growroot cloud-guest-utils"
 	TODO=""
 	for p in $CANDIDATES; do
 		case "$(dpkg-query -W -f='${db:Status-Status}' "$p" 2>/dev/null || echo none)" in
@@ -514,7 +528,7 @@ do_verify() {
 	note(){ echo "  NOTE $*"; }
 
 	echo "== cloud residue =="
-	for p in cloud-init netplan.io netplan-generator python3-netplan libnetplan1 cloud-initramfs-growroot; do
+	for p in cloud-init netplan.io netplan-generator python3-netplan libnetplan1 cloud-initramfs-growroot cloud-guest-utils; do
 		s=$(dpkg-query -W -f='${db:Status-Status}' "$p" 2>/dev/null || echo none)
 		case "$s" in
 		none|not-installed) ok "$p: $s" ;;
@@ -1488,23 +1502,27 @@ do_selftest() {
 		&& ok "strip runs preflight first (grub-fallback MUST precede it -- the header says so)" \
 		|| bad "strip runs with NO precondition check: the boot policy could be absent from the regenerated grub.cfg"
 	local SP; SP="$W/strip.code"; payload_code "$(payload_index 'CANDIDATES=')" > "$SP"
-	for n in cloud-init netplan.io netplan-generator python3-netplan libnetplan1 cloud-initramfs-growroot; do
+	for n in cloud-init netplan.io netplan-generator python3-netplan libnetplan1 cloud-initramfs-growroot cloud-guest-utils; do
 		grep -q "CANDIDATES=.*[\" ]$n[\" ]" "$SP" && ok "the purge list names $n" || bad "the purge list is missing $n"
 	done
-	[ "$(sed -n 's/^CANDIDATES="\(.*\)"$/\1/p' "$SP" | wc -w)" = 6 ] \
-		&& ok "the purge list is exactly 6 packages, no more" \
-		|| bad "the purge list has $(sed -n 's/^CANDIDATES="\(.*\)"$/\1/p' "$SP" | wc -w) entries, expected 6"
-	# ⚠ OPEN FINDING, asserted as it IS and not as anyone wishes it were.
-	# cloud-guest-utils is in the base image, is MANUALLY marked (so purging
-	# cloud-init does not autoremove it), and this stage does not purge it.
-	# docs/architecture.md and stage-runtime-contract.sh both name the generalize
-	# stage as its owner. Adding it here is a decision with consequences --
-	# cloud-utils depends on it -- so this assertion records the truth instead.
-	if grep -q 'cloud-guest-utils' "$SP"; then
-		bad "cloud-guest-utils appeared in the purge list -- that is a real change and needs saying out loud, not asserting quietly"
-	else
-		ok "cloud-guest-utils is NOT purged (open finding: it is base-image, manually marked, and nothing removes it)"
-	fi
+	[ "$(sed -n 's/^CANDIDATES="\(.*\)"$/\1/p' "$SP" | wc -w)" = 7 ] \
+		&& ok "the purge list is exactly 7 packages, no more" \
+		|| bad "the purge list has $(sed -n 's/^CANDIDATES="\(.*\)"$/\1/p' "$SP" | wc -w) entries, expected 7"
+	# 🔴 CLOSED iter 13 by operator ruling. cloud-guest-utils ships in the BASE
+	# IMAGE and is MANUALLY marked, so purging cloud-init does NOT autoremove it
+	# -- it has to be named, and now is. The `verify` phase must check it too, or
+	# the purge is unasserted; that pairing is what this asserts.
+	grep -q 'cloud-guest-utils' "$SP" \
+		&& ok "cloud-guest-utils is purged BY NAME (autoremove would never take it -- it is manually marked)" \
+		|| bad "cloud-guest-utils is not purged: a cloud-* package would ship in an image defined as not carrying one"
+	# 🔴 ANCHORED AT LINE START ON PURPOSE. Without `^[[:space:]]*for p in` this
+	# pattern matches THIS VERY LINE -- the assertion's own source -- and can
+	# therefore never fail. Caught by mutation testing: deleting the package from
+	# verify's loop left the selftest green. The anchor excludes the `if [ ... ]`
+	# line while still matching the loop it is about.
+	if [ -n "${SELF_PATH:-}" ] && grep -qE '^[[:space:]]*for p in cloud-init.*cloud-guest-utils' "$SELF_PATH"; then
+		ok "verify's cloud-residue loop checks cloud-guest-utils too (purged AND asserted, not just purged)"
+	else bad "verify does not check cloud-guest-utils -- the purge would be unasserted"; fi
 	grep -q 'apt-get purge -y' "$SP" && ok "the purge is a PURGE, not a remove (conffiles go too)" || bad "the strip payload does not purge"
 	grep -q 'rm -rf /etc/netplan /etc/cloud /var/lib/cloud' "$SP" \
 		&& ok "the netplan and cloud-init state directories are removed" || bad "the cloud state directories survive"
