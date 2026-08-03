@@ -216,53 +216,129 @@ free to carry:
 AD-2 stands on its own as a **published, signed HTTP repo**. Do not conflate
 the two — dropping the local file repo does not drop AD-2.
 
-**Version scheme — three layers, and only two of them are safety.** A version
+**Version scheme.** 🔴 **Rewritten 2026-08-02 (iter 23): bookworm is dropped
+from image generation, so the three-layer cross-suite design below collapsed to
+a single floor.** Superseded text is struck rather than deleted, because this
+decision has already been reversed more than once and the reasoning is what
+stops another round.
+
+~~**Version scheme — three layers, and only two of them are safety.** A version
 suffix does **not** make cross-suite upgrades safe: every single version axis is
 totally ordered, so `6.12.100-1 gt 6.1.177-1`, `1.0-1~deb13u1 gt 1.0-1~deb12u1`
-and `1.0-1+deb13u1 gt 1.0-1+deb12u1` are all TRUE. The suffix is legibility and
-forensics.
+and `1.0-1+deb13u1 gt 1.0-1+deb12u1` are all TRUE.~~ The arithmetic is still
+correct, but the framing is void: **there is no second suite's package**, so
+there is no cross-suite upgrade to be offered. The suffix is legibility and
+forensics — with one exception noted below.
 
-| Layer | Mechanism | What it stops |
+| Layer | Mechanism | Status |
 |---|---|---|
-| 1 | per-suite `dists/bookworm` and `dists/trixie`; each switch's sources name its own suite, derived from `VERSION_CODENAME` | the wrong package is invisible |
-| 2 | version-constrained `Depends: linux-headers-amd64` | apt **refuses** it even when hand-copied |
-| 3 | honest version: `mlxsw-dkms_6.12.100-1+deb13u1` | the artifact stays reasonable about |
+| ~~1~~ | ~~per-suite `dists/bookworm` and `dists/trixie`~~ | **VOID** — a single `dists/trixie` is published |
+| 2 | version-constrained `Depends: linux-headers-amd64` | ⚠ **only the bookworm half dies** — see below |
+| 3 | honest version: `mlxsw-dkms_6.12.100-1+deb13u1` | ✅ **retained**, and the `+` is load-bearing |
 
-Layer 2 is free, because promoting headers from `Recommends` to `Depends` is
-required anyway (a `Recommends` does not guarantee a toolchain: trixie's `dkms`
-3.2.2 carries `gcc | c-compiler` in **Recommends**, not `Depends`, so a
+⚠ **Layer 2 was symmetric, and only half of it is void.** It specified
+`(>= 6.12)` on the trixie build **and** `(>= 6.1, << 6.12)` on the bookworm
+build. Only the bookworm **ceiling** is gone. The trixie constraint survives and
+is now simply called **the floor**:
+
+```
+Depends: dkms (>= 2.1.0.0), build-essential, linux-headers-amd64 (>= 6.12)
+```
+
+Promoting headers from `Recommends` to `Depends` is required anyway (a
+`Recommends` does not guarantee a toolchain: trixie's `dkms` 3.2.2 carries
+`gcc | c-compiler` in **Recommends**, not `Depends`, so a
 `--no-install-recommends` install resolves cleanly and then fails at
 `postinst`). Measured, `linux-headers-amd64` is `6.1.177-1` on bookworm against
-`6.12.100-1` on trixie, so `(>= 6.12)` is **unsatisfiable on bookworm**.
+`6.12.100-1` on trixie, so `(>= 6.12)` is **unsatisfiable on bookworm** — which
+is exactly why the floor is kept: it makes a hand-copied trixie deb **refuse**
+to install on the two live bookworm switches. Hand-copy is how both were
+installed, so that path is real.
+
+### 🔴 A FLOOR, NEVER A CEILING
+
+Standing rule, installed by the iter-23 ruling. `>=` is compatible with
+self-maintenance because headers only ever move up. A `<<` upper bound breaks
+self-maintenance at the next kernel series bump, and it breaks it by making apt
+**REMOVE** the package — leaving a switch on a new kernel with no mlxsw modules
+*and no package left to rebuild them*. **Never write an upper bound on
+`linux-headers-amd64` in this project.**
 
 🔴 **Use `+debNuN`, never `~debNuN`.** `~` sorts *below* the un-suffixed
-version — `6.1.177-1~deb12u1 gt 6.1.177-1` is **FALSE** — and both live switches
-run exactly `6.1.177-1`, so a `~`-suffixed corrected package would never be
-offered as an upgrade and the fix would silently never reach the fleet.
+version. This is **load-bearing, not cosmetic**: the frozen
+`mlxsw-dkms_6.12.100-1_all.deb` is fully installable and was hand-installed in
+the build VM, so `6.12.100-1+deb13u1 gt 6.12.100-1` is **TRUE** (offered as an
+upgrade) while `6.12.100-1~deb13u1 gt 6.12.100-1` is **FALSE** (never offered).
+⚠ Consequence of versioning on the source vintage: a packaging-only re-cut has
+nowhere to go but `+deb13u2`. The independent `1.0-1` axis is foreclosed.
 
-### 🔴 Dist-upgrade procedure — ADD THE SUITE FIRST
+### ~~🔴 Dist-upgrade procedure — ADD THE SUITE FIRST~~ — VOID
 
-Ruled 2026-08-02. The bookworm package hard-depends on
-`linux-headers-amd64 (<< 6.12)` while Layer 1 puts only that host's own suite in
-its sources. **Compose them and a dist-upgrade removes `mlxsw-dkms`:** the
-installed package becomes unsatisfiable, its trixie replacement is not in
-sources, and apt's only resolution is removal — inside a transaction the
-operator reads as routine. The end state is a switch on a 6.12 kernel with no
-mlxsw modules **and no package left to rebuild them** — R4, reintroduced by the
-mechanism installed to prevent it.
+🔴 **Struck 2026-08-02 (iter 23). Do not implement this procedure.**
 
-**Procedure, mandatory:**
+> ~~Ruled 2026-08-02. The bookworm package hard-depends on
+> `linux-headers-amd64 (<< 6.12)` while Layer 1 puts only that host's own suite in
+> its sources. **Compose them and a dist-upgrade removes `mlxsw-dkms`:** the
+> installed package becomes unsatisfiable, its trixie replacement is not in
+> sources, and apt's only resolution is removal… **Procedure, mandatory:** add the
+> target suite to the switch's apt sources; `apt update`; only then upgrade the
+> kernel / headers. ⚠ The residual risk is therefore accepted knowingly…~~
 
-1. Add the **target** suite (`dists/trixie`) to the switch's apt sources.
-2. `apt update`.
-3. Only then upgrade the kernel / headers.
+**Why it is void.** That failure — "HIGH 1" — was **entirely** a consequence of
+the `<< 6.12` ceiling on the bookworm package. No bookworm package is cut, so
+there is no ceiling, so the finding, the accepted residual risk, and the
+mandatory procedure all die together.
 
-The alternative — expressing the guard as `Breaks:`/`Conflicts:`, which apt will
-not resolve by removing the package — was considered and **not** taken. ⚠ The
-residual risk is therefore accepted knowingly: skip step 1 and the package is
-still removed. Because the written procedure *is* the mitigation, it ships on
-the switch as `/usr/share/doc/mlxsw-dkms/README.Debian`, where an operator can
-reach it mid-upgrade with no repo checkout.
+⚠ `/usr/share/doc/mlxsw-dkms/README.Debian` **still ships**, but carries the
+DKMS/metapackage rationale and a "never install on pre-trixie" warning instead
+of a dist-upgrade procedure.
+
+### The single published artifact
+
+```
+mlnx-switch-packages/dkms/mlxsw-dkms_6.12.100-1+deb13u1_all.deb
+```
+
+The other two debs in that directory are **frozen reference blobs**, never
+installed by any stage: `mlxsw-dkms_6.1.177-1_all.deb` (hardware-proven, the
+fixed point of `tests/test-derive.sh` T1) and `mlxsw-dkms_6.12.100-1_all.deb`
+(provenance root for the published package). Their sha256s are pinned in the
+test harness so a regeneration fails loudly. ⚠ A `*.deb` glob matches all three.
+
+🔴 **No 6.1 package is published, but the 6.1 generation path in
+`scripts/mk-mlxsw-dkms.sh` must survive** — T1 derives the 6.1 object list and
+compares it against the frozen hardware-proven deb. Delete that path as "dead
+code" and the comparison can no longer run.
+
+⚠ **Knowingly unguarded, the reverse direction.** The floor stops
+trixie-deb-onto-bookworm. Nothing stops the reverse: the frozen 6.1.177 deb
+carries headers only as a `Recommends` and, being frozen, can never gain a
+guard — `dpkg -i` onto a trixie switch would build 6.1 source against 6.12
+headers. Mitigating: `6.12.100-1+deb13u1 gt 6.1.177-1`, so **apt** prefers the
+correct package; only a direct `dpkg -i` bites. Accepted rather than left
+silent.
+
+### 🔴 OPEN — how the live fleet reaches trixie
+
+Dropping bookworm defines a target state without a transition plan for the only
+two machines in production. **Ruled:** `mlnx-2410-cameo` and `mlnx-2700-cameo`
+stay on bookworm with `mlxsw-dkms 6.1.177-1`, untouched, and are **re-imaged**
+with the trixie artifact rather than dist-upgraded in place. They already carry
+the `linux-headers-amd64` metapackage with `AUTOINSTALL=yes`, so they
+self-maintain across 6.1.x point releases in the meantime and are not exposed to
+R4.
+
+⚠ **No date, trigger, or owner for that re-image is recorded anywhere.** The
+governing rule is *"self-maintaining so long as the upstream distribution is
+maintained"* — and Debian 12's regular support window is at or past its end as
+of 2026-08 (**verify current status before acting**), which would put both
+production switches outside the very condition that rule is conditional on.
+Not urgent — DKMS keeps them working regardless — but it is an unclosed
+transition, not an oversight to be rediscovered later.
+
+Candidate triggers, none yet chosen: bookworm LTS security-support end;
+`boot-test-both-boot-paths` going green; the SN2700's swap-after-root layout
+(**not growable in place** — re-imaging fixes it for free) becoming a problem.
 
 ### AD-3 — Customize an official cloud image in a slaved VM
 
