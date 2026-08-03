@@ -1,4 +1,4 @@
-#root@deb12mlnx:~# cat /etc/udev/rules.d/10-local.rules
+# Provenance: /etc/udev/rules.d/10-local.rules on mlnx-2410-cameo. Rule unchanged.
 SUBSYSTEM=="net", ACTION=="add", DRIVERS=="mlxsw_spectrum*", \
     NAME="sw$attr{phys_port_name}"
 

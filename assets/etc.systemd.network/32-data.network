@@ -1,28 +1,34 @@
+# The data bridge's own L3 interface. It takes an address and contributes no
+# default route on either family.
 [Match]
 Name=data
 
+# IPv4-only, deliberately. This bridge previously accepted router
+# advertisements, which installed an IPv6 default route entirely outside the
+# DHCP settings below; it also advertised itself as a router and offered prefix
+# delegation onto a production segment. All of that is gone, so "data
+# contributes no default route" now holds on both families trivially.
 [Network]
-DHCP=yes
+DHCP=ipv4
+LinkLocalAddressing=ipv4
+IPv6AcceptRA=false
 
-[Network]
-IPv6SendRA=yes
-IPv6AcceptRA=true
-DHCPv6PrefixDelegation=yes
-
+# Address, no gateway, no routes. This removes data's eligibility for a default
+# route rather than ranking it behind mgmt; the metric-based workaround the
+# fleet runs today is not carried into the image.
 [DHCPv4]
-RouteMetric=100
-UseDomains=true
-UseDNS=true
+UseRoutes=false
+UseGateway=false
 
-[DHCPv6]
-RouteMetric=200
-PrefixDelegationHint=::/56
-
-
+# 1500 is written explicitly and must not be "simplified" away: since Linux 4.17
+# a bridge with no explicit MTU tracks the minimum MTU of its ports, so with the
+# front-panel ports at 9000 an unset bridge MTU becomes 9000 -- the exact defect
+# this removes. A bridge's own MTU constrains locally terminated traffic only,
+# so 9000-byte transit between two front-panel ports still works.
+#
+# Not required for network-online.target: this interface carries no default
+# route, and on a switch with every front-panel port dark it will never gain
+# carrier. systemd skips a link with this setting rather than failing it.
 [Link]
-MACAddress=7c:fe:90:ff:92:7d
-MTUBytes=9000
-
-#Address=10.10.100.13/22
-#Gateway=10.10.100.1
-#DNS=10.10.100.1
+MTUBytes=1500
+RequiredForOnline=no

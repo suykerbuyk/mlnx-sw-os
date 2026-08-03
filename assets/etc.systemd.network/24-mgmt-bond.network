@@ -1,18 +1,11 @@
+# Enslaves the management NICs to the bond by an intrinsic property, so one
+# generic image works on every model without per-host name lists.
+#
+# Caveat, noted and not pre-solved: this matches *any* e1000e NIC. On the
+# measured hardware that is exactly the two management ports; a third e1000e NIC
+# would be enslaved too. At that point switch to Path=.
 [Match]
-Name=eth0
-Name=eno1
-Name=enp0s25
-
-[Network]
-Bond=mgmt-bond
-PrimarySlave=true
-
-
-[Match]
-Name=eth1
-Name=ens6
-Name=enp6s0
+Driver=e1000e
 
 [Network]
 Bond=mgmt
-PrimarySlave=false

@@ -2,6 +2,11 @@
 Name=data
 Kind=bridge
 
+# The data bridge is a flat, non-VLAN-aware L2 domain. Stated explicitly because
+# it is a decision, not a default. With filtering off the bridge keeps no VLAN
+# table, so a default port VLAN has nothing to apply to; the out-of-range value
+# that used to sit here was accepted by systemd but did nothing, and read as an
+# active policy. If this bridge is ever meant to be VLAN-aware, turn filtering on
+# and set a PVID in the documented 1-4094 range in the same change.
 [Bridge]
-DefaultPVID=0
 VLANFiltering=false

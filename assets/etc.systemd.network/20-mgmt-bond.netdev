@@ -2,7 +2,11 @@
 Name=mgmt
 Kind=bond
 
+# The bond ships with no primary member, deliberately: both management NICs are
+# bound by one intrinsic match, so no generic unit can single one of them out.
+# Failover is therefore last-carrier-wins. The reselect policy that used to sit
+# here was inert without a primary and has been removed rather than left in
+# place reading as an active policy.
 [Bond]
 Mode=active-backup
-PrimaryReselectPolicy=always
 MIIMonitorSec=1s

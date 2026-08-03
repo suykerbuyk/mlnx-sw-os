@@ -1,5 +1,20 @@
+# The front-panel ports. Bound by driver, not by name, so enslavement does not
+# depend on the udev rename having run. The glob keeps matching if a Spectrum-2
+# or -3 driver is named differently.
 [Match]
-Name=swp*
+Driver=mlxsw_spectrum*
 
 [Network]
 Bridge=data
+
+# 9000 is written here deliberately -- this file previously set no MTU at all,
+# so the jumbo MTU seen on the fleet does not come from the image. Front-panel
+# ports are transit, not hosts, so they are the one place jumbo belongs.
+#
+# Not required for network-online.target: on a 32- or 56-port switch most ports
+# are dark, and a dark port would otherwise stall boot until wait-online times
+# out and then fail. systemd skips a link with this setting rather than failing
+# it, so nothing has to be muted downstream.
+[Link]
+MTUBytes=9000
+RequiredForOnline=no
