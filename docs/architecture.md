@@ -676,12 +676,35 @@ all.**
 DHCP=ipv4
 LinkLocalAddressing=ipv4
 IPv6AcceptRA=false
-MTUBytes=1500
 
 [DHCPv4]
 UseRoutes=false
 UseGateway=false
+
+[Link]
+MTUBytes=1500
 ```
+
+🔴 **`MTUBytes=` is a `[Link]` key, never `[Network]`** — corrected 2026-08-02
+after an earlier revision of this section placed it under `[Network]`. Verified
+against systemd-networkd's own gperf key table, which *is* the parser:
+
+```
+$ strings /usr/lib/systemd/systemd-networkd | grep -E '^(Link|Network|NetDev)\.MTUBytes$'
+Link.MTUBytes
+NetDev.MTUBytes          # <- no Network.MTUBytes
+```
+
+A key absent from that table is an **Unknown key name** and is **silently
+dropped**, so the bridge would have re-inherited **9000** from its member ports —
+reproducing the exact defect this section exists to correct, on a segment with
+no path-MTU discovery for on-link neighbours. It is the `[DHCP]` vs `[DHCPv4]`
+failure one subsection over: an unrecognised key in a valid-looking file,
+accepted in silence.
+
+⚠ Read from systemd **261** (the Arch build host). The shipped image is **257**
+and the fleet is **252**; `MTUBytes` has been a `[Link]` key for many releases,
+but the authoritative check for the artifact is 257.
 
 🔴 **The keys go under `[DHCPv4]`, never `[DHCP]`.** Measured: `[DHCP]` is a
 valid legacy compat section and `UseRoutes=` works there, but **`UseGateway=`
@@ -840,7 +863,7 @@ Resulting modules: `mlxsw_core`, `mlxsw_pci`, `mlxsw_i2c`, `mlxsw_spectrum`,
 | R2 | **Secure Boot vs unsigned modules.** | **Narrowed twice.** Trixie ships `CONFIG_MODULE_SIG=y` with `MODULE_SIG_FORCE` **unset**, so unsigned OOT modules load and merely taint (12+13). Further, trixie's DKMS now **auto-generates a MOK and signs modules** (`/var/lib/dkms/mok.key`; `modinfo -F signer` → *"DKMS module signing key"*). So enabling Secure Boot is **MOK enrollment**, not building a signing pipeline. ⚠ Each machine generates its **own** key at first install — a fleet image must choose per-switch enrollment or a shared baked key. |
 | R3 | **SN3700C entirely untested** — Spectrum-2 silicon, UEFI boot, no unit yet imaged. | Blocked on hardware time. Possibly narrowed: the base image carries both `bios_grub` and an ESP (see AD-5). |
 | R4 | **Boot-with-no-ports** after a kernel upgrade. | 🔴 **OBSERVED, not theoretical — 2026-08-01.** Reproduced end to end in the VM (see §9). Mitigated by the stock-driver management plane and the retained previous kernel, and requires the **`linux-headers-amd64` metapackage** (mandatory) plus the **detection-and-recovery ladder** below. 🔴 **A GRUB fallback policy does NOT mitigate R4** — see the detail section; that claim stood here through three review passes and is wrong. |
-| R5 | **No automated verification exists.** | **Partly closed.** `tests/test-derive.sh` (23 assertions) and `scripts/mlxsw-premise-audit.sh` (26 assertions, runs against the VM *or* a live switch, read-only) are automated. Image boot-testing is still manual. |
+| R5 | **No automated verification exists.** | **Partly closed.** `tests/test-derive.sh` (**51** assertions), `scripts/stage-grub-fallback.sh selftest` (**40** assertions, no VM/root/network — proves the modules-present check FAILS on five distinct broken shapes) and `scripts/mlxsw-premise-audit.sh` (26 assertions, runs against the VM *or* a live switch, read-only) are automated. Image boot-testing is still manual. |
 | R6 | 🔴 **Trixie has NO stable kernel ABI number.** Bookworm's `6.1.0-51-amd64` holds across point releases; trixie moved `6.12.94 → .96 → .100` inside this project's own timeline. `uname -r` changes on **every** kernel update, so DKMS rebuilds every time — each one an R4 opportunity. | Open. This is a real argument against AD-1 that did not exist on 6.1 evidence. **Never hardcode a point release** anywhere in the tooling. |
 
 ### R4 in detail — the failure that was reproduced
@@ -1047,14 +1070,44 @@ process and should not be carried into the Trixie rebuild:
 **GRUB drop-in contract** (`/etc/default/grub.d/`, sourced *after*
 `/etc/default/grub`, so it beats the main file):
 
-| File | Owns |
-|---|---|
-| `20_switch-cmdline.cfg` | `GRUB_CMDLINE_LINUX` (**append**, never assign), `GRUB_TERMINAL` |
-| `25_switch-boot-policy.cfg` | `GRUB_DEFAULT`, `GRUB_TIMEOUT`, `GRUB_TIMEOUT_STYLE` |
+The directory is a **THREE-way** share, not two — the base's own `10_cloud.cfg`
+is part of the contract and is deliberately retained:
+
+| File | Owns | Author |
+|---|---|---|
+| `10_cloud.cfg` | `GRUB_DISABLE_LINUX_UUID=true` (root by **PARTUUID**) | the base image — **kept**, see below |
+| `20_switch-cmdline.cfg` | `GRUB_CMDLINE_LINUX` (**append**, never assign), `GRUB_TERMINAL`, `GRUB_SERIAL_COMMAND` | `s4-runtime-contract-assets` |
+| `25_switch-boot-policy.cfg` | `GRUB_DEFAULT`, `GRUB_TIMEOUT`, `GRUB_TIMEOUT_STYLE` | `stage-grub-fallback` |
 
 Two digits, always — glob order is **lexical, not numeric**, so a `100_` file
-would sort *before* `20_`. Both must sort after the base's own `10_cloud.cfg`
-and `15_timeout.cfg`.
+would sort *before* `20_`. Ours must sort after `10_cloud.cfg` and
+`15_timeout.cfg`.
+
+🔴 **The invariant is DISJOINTNESS BY VARIABLE, not prefix order**, and the
+distinction is load-bearing:
+
+- `GRUB_TERMINAL` is safe at any prefix. `grub-mkconfig:179-181` expands it into
+  **both** `GRUB_TERMINAL_INPUT` and `GRUB_TERMINAL_OUTPUT` *after* the drop-in
+  loop, so it beats a `GRUB_TERMINAL_OUTPUT` set in any file at any prefix.
+- **`GRUB_SERIAL_COMMAND` has no such coupling.** It is plain
+  last-assignment-wins, so a higher-numbered file setting it would silently
+  clobber `20_`. This is the one place the ordering dependency is *real* rather
+  than the phantom the two-file analysis dissolved.
+
+`25_switch-boot-policy.cfg` therefore does not name the cmdline drop-in's three
+variables **even in its comments**, which makes a plain `grep` a genuine proof of
+the split. Verified on `master`: each of the six variables appears in exactly one
+file.
+
+⚠ `GRUB_SERIAL_COMMAND` must match the kernel console (`console=ttyS0,115200`).
+Without it `00_header:181-187` warns and falls back to a bare `serial` — **9600
+baud** — giving an unreadable boot menu at exactly the moment someone needs one.
+
+⚠ **The base's `/etc/default/grub.d/` has never been exhaustively enumerated.**
+Only `10_cloud.cfg` and `15_timeout.cfg` are on record, each with a single key,
+and nothing above prefix `15_` was ever examined. "Nothing in the base sorts
+after `20_`" is an **assumption**, not an established fact. The defence is the
+generated-`grub.cfg` assertion — the only artifact that shows who actually won.
 
 🔴 **The base's `15_timeout.cfg` sets `GRUB_TIMEOUT=0`**, overriding the `5`
 visible in `/etc/default/grub` — so the effective base timeout is **0, and no
