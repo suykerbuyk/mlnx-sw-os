@@ -31,6 +31,18 @@ SSH_PORT="${SSH_PORT:-2222}"
 BOOT_TIMEOUT="${BOOT_TIMEOUT:-300}" # hard ceiling on the readiness poll
 BUILD_USER="${BUILD_USER:-builder}"
 
+# QMP control port -- the out-of-band power channel. DERIVED from SSH_PORT on
+# purpose, never defaulted independently: safe concurrent VM work already
+# requires a distinct WORK and a distinct SSH_PORT per agent, and a separately
+# defaulted monitor port would be a third thing to get right. Two agents on the
+# defaults would silently share one control channel over each other's guest.
+# Derived, the existing discipline covers it by construction.
+MON_PORT="${MON_PORT:-$((SSH_PORT + 1000))}"
+# How long to wait for ACPI to be acted on before force-killing. A guest whose
+# kernel has already wedged ignores the power button too, so this MUST time out
+# and fall through rather than read as a guarantee.
+ACPI_TIMEOUT="${ACPI_TIMEOUT:-60}"
+
 case "$DISTRO" in
 debian)
 	# GENERIC, not nocloud and not genericcloud. Measured 2026-08-01:
@@ -93,6 +105,71 @@ vm_running() {
 }
 
 ssh_vm() { ssh "${SSH_OPTS[@]}" "$BUILD_USER@127.0.0.1" "$@"; }
+
+# Poll the pidfile until the guest is gone. Returns 0 if it went down.
+#
+# 🔴 Liveness is read from the PIDFILE, never from a process name. Neither
+# `pgrep -f` nor `pkill -f` may be used here or anywhere near this script: both
+# match the full command line of the shell that invokes them. `pgrep -f`
+# reported a VM as running when it had already exited (2026-08-02) and
+# `pkill -f qemu-system` destroyed the build VM outright (2026-08-03).
+wait_down() {
+	local limit="$1" waited=0
+	while vm_running && [ "$waited" -lt "$limit" ]; do
+		sleep 2; waited=$((waited + 2))
+	done
+	! vm_running
+}
+
+# ------------------------------------------------------ out-of-band power
+# The guest's only control channel that does not depend on the guest's network
+# or on a login. Without it an unreachable guest can only be SIGTERMed, and
+# qemu does NOT translate SIGTERM into an ACPI power-down request -- it is a
+# power cut, and it ships a dirty filesystem into an image that gets `dd`'d
+# onto production switches. It is also the ONLY path left after
+# stage-generalize's `finish`, which removes the very user ssh_vm() connects as.
+#
+# QMP over loopback TCP, spoken with bash's own /dev/tcp: the build-host
+# dependency set stays qemu, xorriso and curl. socat, nc and python3 would each
+# add one. QMP rather than HMP because HMP is explicitly not a stable interface.
+
+# Read one QMP reply, skipping asynchronous events. 0 on {"return":...}.
+qmp_reply() {
+	local line n=0
+	while [ "$n" -lt 20 ]; do
+		n=$((n + 1))
+		IFS= read -r -t 5 line <&3 || return 1
+		case "$line" in
+		*'"event"'*)  continue ;;
+		*'"return"'*) return 0 ;;
+		*'"error"'*)  return 1 ;;
+		esac
+	done
+	return 1
+}
+
+# Press the virtual ACPI power button. 0 only if qemu acknowledged the command
+# -- which means the button was pressed, NOT that the guest acted on it. A
+# guest with a wedged kernel ignores ACPI exactly as it ignores ssh, so the
+# caller must still wait and still fall through.
+qmp_powerdown() {
+	local greeting
+	# 🔴 The redirection is scoped to a BRACE GROUP, never attached to `exec`.
+	# `exec` with only redirections applies them to the SHELL, permanently: a
+	# bare `exec 3<>... 2>/dev/null` sends this script's stderr to /dev/null
+	# for the rest of the run -- including rung 3's power-cut warning. That is
+	# this project's signature bug class (four instances in iter 12, the first
+	# of them this exact idiom), and it reappeared here, inside the ladder
+	# written to make failures loud. Caught by watching a real failure print.
+	{ exec 3<>"/dev/tcp/127.0.0.1/$MON_PORT"; } 2>/dev/null || return 1
+	IFS= read -r -t 5 greeting <&3   || { exec 3>&-; return 1; }
+	case "$greeting" in *'"QMP"'*) ;; *) exec 3>&-; return 1 ;; esac
+	printf '{"execute":"qmp_capabilities"}\n' >&3
+	qmp_reply                        || { exec 3>&-; return 1; }
+	printf '{"execute":"system_powerdown"}\n' >&3
+	qmp_reply                        || { exec 3>&-; return 1; }
+	exec 3>&-
+}
 
 # Readiness is a poll against the forwarded port with a hard ceiling -- not a
 # fixed sleep, and not console pattern-matching.
@@ -214,6 +291,7 @@ do_up() {
 		-netdev user,id=n0,hostfwd=tcp:127.0.0.1:"$SSH_PORT"-:22 \
 		-device virtio-net-pci,netdev=n0 \
 		-display none -serial file:"$SERIAL" \
+		-qmp tcp:127.0.0.1:"$MON_PORT",server=on,wait=off \
 		-pidfile "$PIDFILE" -daemonize
 
 	wait_ssh "ssh"
@@ -367,6 +445,14 @@ do_status() {
 		printf 'running  pid=%s  ssh -i %s -p %s %s@127.0.0.1\n' \
 			"$(cat "$PIDFILE")" "$KEY" "$SSH_PORT" "$BUILD_USER"
 		ssh_vm true 2>/dev/null && echo "ssh:     reachable" || echo "ssh:     NOT reachable"
+		# Report the out-of-band channel separately: after `finish` this is
+		# the only one left, so "ssh NOT reachable" alone does not say
+		# whether the guest can still be powered down cleanly.
+		if (exec 3<>"/dev/tcp/127.0.0.1/$MON_PORT") 2>/dev/null; then
+			echo "qmp:     reachable on 127.0.0.1:$MON_PORT"
+		else
+			echo "qmp:     NOT reachable on 127.0.0.1:$MON_PORT (booted before -qmp?)"
+		fi
 	else
 		echo "stopped"
 	fi
@@ -374,15 +460,58 @@ do_status() {
 	[ -f "$IMG" ] && echo "image:   $IMG ($(du -h "$IMG" | cut -f1) on disk)" || echo "image:   not prepared"
 }
 
+# A LADDER, and the rungs are not interchangeable. Each one reaches the guest
+# by a path the previous one has just failed on, and only the last is a power
+# cut. The force rung is retained -- an unkillable qemu is worse than a dirty
+# image -- but it is reached deliberately and it announces what it did.
 do_down() {
 	vm_running || { info "not running"; return 0; }
-	info "graceful poweroff"
-	ssh_vm 'sudo systemctl poweroff' 2>/dev/null || true
-	local waited=0
-	while vm_running && [ "$waited" -lt 60 ]; do sleep 2; waited=$((waited + 2)); done
-	vm_running && { info "forcing"; kill "$(cat "$PIDFILE")" 2>/dev/null || true; } || true
+
+	# Rung 1 -- ssh. Preferred whenever the guest is reachable: it is the
+	# only rung where the guest's own shutdown sequence runs from userspace.
+	#
+	# Probe FIRST rather than firing and waiting out the timeout. The exact
+	# case this ladder exists for -- an unreachable guest, and every guest
+	# after stage-generalize's `finish` -- is the case where rung 1 cannot
+	# work, and spending 60s proving that again on every call is how a
+	# recovery path acquires a reputation for being slow enough to skip.
+	# The poweroff exit status is NOT usable for this: a successful poweroff
+	# drops the connection and reports failure just as a dead sshd does.
+	if ssh_vm true 2>/dev/null; then
+		info "poweroff over ssh"
+		ssh_vm 'sudo systemctl poweroff' 2>/dev/null || true
+		if wait_down 60; then
+			rm -f "$PIDFILE"; info "down"; return 0
+		fi
+		info "ssh accepted the poweroff but the guest is still up"
+	else
+		info "ssh is not answering -- going straight to the out-of-band path"
+	fi
+
+	# Rung 2 -- the ACPI power button over QMP. This is the rung that did not
+	# exist before, and it is the one that matters: it needs no guest network
+	# and no login, so it works when ssh is dead AND after `finish` has removed
+	# the builder user, which is when rung 1 is dead by construction.
+	info "pressing the ACPI power button over QMP"
+	if qmp_powerdown; then
+		if wait_down "$ACPI_TIMEOUT"; then
+			rm -f "$PIDFILE"; info "down (ACPI power button)"; return 0
+		fi
+		info "ACPI was accepted but the guest did not act on it within ${ACPI_TIMEOUT}s"
+	else
+		info "QMP not answering on 127.0.0.1:$MON_PORT -- guest booted before -qmp existed?"
+	fi
+
+	# Rung 3 -- SIGTERM. qemu does not turn this into an ACPI request, so the
+	# guest OS never sees it: this is a power cut and the filesystem is dirty.
+	# Say so. A silent "down" here is what let a killed guest read as a clean
+	# one on 2026-08-03.
+	info "FORCING -- SIGTERM to qemu. This is a POWER CUT: the guest filesystem"
+	info "is dirty and the image is NOT defensible provenance for a switch."
+	kill "$(cat "$PIDFILE")" 2>/dev/null || true
+	wait_down 20 || true
 	rm -f "$PIDFILE"
-	info "down"
+	info "down (FORCED -- dirty)"
 }
 
 do_destroy() {
