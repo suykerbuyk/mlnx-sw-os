@@ -1,0 +1,35 @@
+# Hostile os-release fixture -- input for T17.
+#
+# os-release is shell syntax by specification, so the lazy way to read it is
+# `. /etc/os-release`. That is safe for /etc/os-release and ONLY for
+# /etc/os-release: mk-mlxsw-dkms.sh takes --os-release as an arbitrary path,
+# and sourcing an arbitrary path hands that file the generator's variable
+# namespace and a shell.
+#
+# The legitimate keys below are real, correct trixie values. That is
+# deliberate: a parser and a sourcer both derive "trixie / +deb13u1" from
+# them, so the ONLY observable difference between the two is whether the
+# payload underneath takes effect.
+PRETTY_NAME="Debian GNU/Linux 13 (trixie)"
+NAME="Debian GNU/Linux"
+VERSION_ID="13"
+VERSION="13 (trixie)"
+VERSION_CODENAME=trixie
+ID=debian
+
+# ---- payload: the generator's own internals, spelled exactly ----
+# Sourced, these rewrite the package's identity behind the script's back --
+# PKGVER is what lands in the Version: field, and SUITE_TAG_SET=1 would tell
+# derive_suite() an operator had already stated the tag.
+VER=9.9.9
+PKGVER=9.9.9-666
+SUITE=pwned
+SUITE_TAG=+PWNED
+SUITE_TAG_SET=1
+OUTDIR=/dev/null
+
+# ---- payload: arbitrary execution ----
+# Sourced, this runs. T17 points T17_MARKER at a path inside its tmpdir and
+# then asserts that path does not exist; unset it is a harmless touch of
+# /dev/null, so the fixture is inert outside the test.
+EVIL_SIDE_EFFECT=$(touch "${T17_MARKER:-/dev/null}")
