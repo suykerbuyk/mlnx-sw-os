@@ -1,0 +1,35 @@
+# Identity at first boot -- and ONLY identity.
+#
+# This unit does NOT own growth. The root partition is grown by
+# systemd-repart (/etc/repart.d/50-root.conf) and the filesystem by
+# x-systemd.growfs on the root fstab entry; both are systemd-native on Debian
+# and on Arch, which is the whole reason they were chosen over
+# cloud-initramfs-growroot.
+#
+# ConditionFirstBoot=yes is true exactly when /etc/machine-id was unpopulated
+# at boot -- which is precisely the state scripts/stage-generalize.sh leaves the
+# artifact in (machine-id truncated to an empty file, per machine-id(5)). So the
+# unit fires once, on the first boot after imaging, and is SKIPPED (not failed)
+# on every boot after that. A skipped Condition* keeps `systemctl --failed`
+# clean with nothing muted, which is the project's rule: condition units, never
+# allowlist them.
+#
+# Ordering: before sshd (it regenerates the host keys sshd needs) and before
+# systemd-networkd (so DHCP does not announce the pre-generalize hostname).
+# Ordering edges naming units that do not exist on a given distro -- ssh.service
+# on Arch, sshd.service on Debian -- are inert, which is what makes one file
+# work on both.
+[Unit]
+Description=Switch first-boot identity (hostname, SSH host keys, machine-id)
+Documentation=man:machine-id(5) man:ssh-keygen(1)
+ConditionFirstBoot=yes
+After=systemd-remount-fs.service
+Before=systemd-networkd.service systemd-user-sessions.service ssh.service sshd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/switch-firstboot
+
+[Install]
+WantedBy=multi-user.target

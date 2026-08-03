@@ -1,0 +1,47 @@
+# Create the swapfile on first boot -- AD-4: swap is a FILE, never a partition.
+#
+# 🔴 A swap PARTITION is the defect re-imaging exists to fix. mlnx-2700-cameo
+# ships sda2 swap after sda1 root, which makes root non-growable in place; the
+# 2410 had to have its swap partition and extended container deleted by hand
+# before root could be extended. Anything that puts swap back in the partition
+# table rebuilds exactly that problem. 2 GiB matches what mlnx-2410-cameo runs
+# today, so re-imaged switches converge on the known-good shape.
+#
+# 🔴 NOT baked into the artifact. A 2 GiB file in the image inflates every build
+# and every dd for no benefit, and it would have to be allocated against the
+# un-grown 8 GB root. scripts/stage-generalize.sh removes /swapfile and its
+# fstab line during generalization precisely so it is created here instead.
+#
+# 🔴 ORDERING -- the whole reason this is a separate unit rather than an
+# ExecStartPost anywhere. The swapfile must be allocated only after BOTH halves
+# of growth have run:
+#   systemd-repart.service        grows the root PARTITION
+#   systemd-growfs-root.service   grows the root FILESYSTEM (x-systemd.growfs)
+# Allocate before those and 2 GiB comes out of an 8 GB root that was about to
+# become 512 GB -- on the fleet's real disks that is a quarter of the
+# filesystem, and it is invisible afterwards. systemd-growfs@-.service is named
+# too because the generator may produce either name for the root mount;
+# ordering edges naming units that do not exist are inert.
+#
+# This unit is NOT ConditionFirstBoot=yes, deliberately. ConditionPathExists=!
+# expresses the real condition -- "there is no swapfile" -- so a boot where
+# creation failed retries on the next one instead of never trying again, and a
+# unit whose Condition fails is marked SKIPPED, not failed, which keeps
+# `systemctl --failed` clean with nothing muted.
+[Unit]
+Description=Create the switch swapfile (AD-4: a file, never a partition)
+Documentation=man:swapon(8) man:systemd-repart.service(8)
+ConditionPathExists=!/swapfile
+After=systemd-repart.service systemd-growfs-root.service systemd-growfs@-.service
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/switch-swapfile
+# Allocation is hole-free, so on a slow switch CPU with a spinning-rust-era SSD
+# a 2 GiB write can take a while. This runs once in the machine's lifetime.
+TimeoutStartSec=900
+
+[Install]
+WantedBy=multi-user.target

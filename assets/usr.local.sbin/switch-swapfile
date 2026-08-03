@@ -1,0 +1,117 @@
+#!/bin/sh
+# Create and activate the switch swapfile. Installed to
+# /usr/local/sbin/switch-swapfile and run once by switch-swapfile.service,
+# which orders it after systemd-repart and x-systemd.growfs (see that unit).
+#
+# AD-4: swap is a FILE. A swap PARTITION after root is what makes a root
+# filesystem non-growable in place, which is the defect re-imaging exists to
+# fix. Nothing here may ever touch the partition table.
+#
+# Idempotent and safe to re-run: it exits 0 without changing anything if a
+# swapfile already exists, if swap is already active, or if the fstab entry is
+# already there.
+#
+# POSIX sh, no bashisms -- it has to survive a swap of the base distro.
+set -eu
+
+SWAPFILE="${SWAPFILE:-/swapfile}"
+SIZE_MB="${SIZE_MB:-2048}"      # 2 GiB -- what mlnx-2410-cameo runs today
+HEADROOM_MB=1024                # refuse to fill the root filesystem
+
+log()  { printf 'switch-swapfile: %s\n' "$*"; }
+die()  { printf 'switch-swapfile: ERROR: %s\n' "$*" >&2; exit 1; }
+
+# ---------------------------------------------------------------- guards
+# NOT `[ -s /proc/swaps ]`: procfs reports st_size 0 for a file with content,
+# so a size test reads "no swap" on a machine that is swapping. Count rows.
+if [ "$(sed -n '2,$p' /proc/swaps 2>/dev/null | wc -l)" -gt 0 ]; then
+	log "swap is already active:"
+	sed -n '2,$p' /proc/swaps | sed 's/^/  /'
+	exit 0
+fi
+
+if [ -e "$SWAPFILE" ]; then
+	log "$SWAPFILE already exists -- not recreating it"
+else
+	# 🔴 Filesystem check, asserted rather than assumed. A naive swapfile is
+	# INVALID on btrfs: copy-on-write means the file has no stable physical
+	# extents, and swapon refuses it unless the file was created nodatacow
+	# (chattr +C) on an uncompressed, non-RAID subvolume. Rather than encode
+	# that here for a case this image is not expected to hit, refuse loudly
+	# and leave a switch with no swap instead of a switch that silently
+	# failed to get one.
+	FSTYPE=$(findmnt -no FSTYPE / 2>/dev/null || echo unknown)
+	case "$FSTYPE" in
+	ext2|ext3|ext4|xfs)
+		log "root filesystem is $FSTYPE -- swapfile supported" ;;
+	btrfs)
+		die "root filesystem is btrfs; a plain swapfile is invalid there \
+(needs chattr +C at creation, no compression, no RAID). Refusing rather than \
+creating something swapon will reject." ;;
+	*)
+		die "root filesystem is '$FSTYPE'; refusing to create a swapfile on an \
+unrecognised filesystem" ;;
+	esac
+
+	AVAIL_MB=$(df -P -m / | awk 'NR==2 {print $4}')
+	case "$AVAIL_MB" in
+	''|*[!0-9]*) die "could not read available space on /" ;;
+	esac
+	[ "$AVAIL_MB" -gt "$((SIZE_MB + HEADROOM_MB))" ] \
+		|| die "only ${AVAIL_MB} MiB free on / -- need ${SIZE_MB} MiB plus \
+${HEADROOM_MB} MiB headroom. Did the growth step run? This unit is ordered \
+after systemd-repart and systemd-growfs-root precisely so it does not allocate \
+into an un-grown root."
+
+	log "allocating ${SIZE_MB} MiB at $SWAPFILE (${AVAIL_MB} MiB free)"
+	rm -f "$SWAPFILE.partial"
+	# fallocate first because it is near-instant; it produces unwritten
+	# extents on ext4, which swapon accepts. If this filesystem hands back
+	# something swapon calls "holes", fall back to a hole-free dd. The
+	# outcome is asserted below either way -- never the tool's exit status.
+	if ! fallocate -l "${SIZE_MB}M" "$SWAPFILE.partial" 2>/dev/null; then
+		log "fallocate unavailable or refused -- writing zeroes instead"
+		dd if=/dev/zero of="$SWAPFILE.partial" bs=1M count="$SIZE_MB" status=none
+	fi
+	# 🔴 0600 before mkswap: swapon refuses a world-readable swapfile, and a
+	# readable one leaks whatever was paged out.
+	chmod 0600 "$SWAPFILE.partial"
+	mv "$SWAPFILE.partial" "$SWAPFILE"
+fi
+
+chmod 0600 "$SWAPFILE"
+
+# mkswap refuses a file that already carries a signature, which is right for a
+# re-run; only sign a file that is not signed yet.
+if ! blkid -p -u other "$SWAPFILE" 2>/dev/null | grep -q 'swap'; then
+	mkswap "$SWAPFILE" >/dev/null || die "mkswap failed on $SWAPFILE"
+	log "mkswap done"
+fi
+
+if ! swapon "$SWAPFILE" 2>/dev/null; then
+	# The classic cause is a sparse file -- swapon says "skipping - it appears
+	# to have holes". Rebuild it hole-free, once, and assert the outcome.
+	log "swapon refused $SWAPFILE -- rebuilding it hole-free"
+	rm -f "$SWAPFILE"
+	dd if=/dev/zero of="$SWAPFILE" bs=1M count="$SIZE_MB" status=none
+	chmod 0600 "$SWAPFILE"
+	mkswap "$SWAPFILE" >/dev/null || die "mkswap failed on the rebuilt $SWAPFILE"
+	swapon "$SWAPFILE" || die "swapon still refuses $SWAPFILE"
+fi
+
+# ---------------------------------------------------------------- fstab
+# nofail: if the swapfile is ever removed by hand, the generated .swap unit
+# should skip rather than fail the boot -- this unit then recreates it on the
+# next boot, because its condition is "no swapfile", not "first boot".
+if ! awk 'NF>=6 && $1=="'"$SWAPFILE"'" && $3=="swap" {f=1} END{exit !f}' /etc/fstab; then
+	printf '%s\tnone\tswap\tsw,nofail\t0\t0\n' "$SWAPFILE" >> /etc/fstab
+	log "added the fstab entry"
+	systemctl daemon-reload 2>/dev/null || true
+fi
+
+# Assert the OUTCOME, never a tool's exit status. Field-matched, not
+# prefix-grepped: /proc/swaps separates its columns with tabs.
+awk '$1=="'"$SWAPFILE"'" {f=1} END{exit !f}' /proc/swaps \
+	|| die "$SWAPFILE is not active in /proc/swaps"
+log "active: $(awk '$1=="'"$SWAPFILE"'" {print $1, $2, $3}' /proc/swaps)"
+log "done"

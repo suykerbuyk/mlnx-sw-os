@@ -1,0 +1,44 @@
+# FALLBACK ONLY -- normally NOT installed.
+#
+# scripts/stage-generalize.sh prefers the SHIPPED systemd-repart.service and
+# installs this file only when the shipped unit cannot be relied on in the
+# guest (masked, not wanted by sysinit.target, or systemd-growfs-root.service
+# does not order itself After=systemd-repart.service).
+#
+# Why the shipped unit is preferred: upstream systemd already solves the
+# ordering this unit exists to force. systemd-growfs@.service and
+# systemd-growfs-root.service both carry `After=systemd-repart.service`, and
+# systemd-repart.service ships a static wants symlink in
+# /usr/lib/systemd/system/sysinit.target.wants/ -- so the filesystem grow
+# already waits for the partition grow, on the same boot, with nothing of ours
+# in the picture. Read off systemd 261 on the build host; the guest must
+# confirm the same for Debian's systemd 257 (see the script's `verify` phase).
+#
+# [Unit] below is verbatim from the proven configuration recorded in the task.
+# Two deliberate divergences, both flagged rather than silently applied:
+#   - [Install] is added; the recorded text had none, and `systemctl enable`
+#     cannot enable a unit with no [Install] section.
+#   - SuccessExitStatus=76/77 is NOT copied from the shipped unit. 76 is "no
+#     root block device" and 77 is "no GPT partition table"; on this artifact
+#     both are genuine failures worth surfacing in `systemctl --failed`.
+#
+# UNVERIFIED: this unit has never been booted with this [Install] section. The
+# Before=local-fs-pre.target edge plus WantedBy=sysinit.target is a shape that
+# can produce an ordering cycle (sysinit.target is After=local-fs.target).
+# If this fallback is ever selected, boot the guest once and assert the journal
+# contains no "Found ordering cycle" before shipping anything built with it.
+[Unit]
+Description=Grow the root partition to fill the disk
+DefaultDependencies=no
+ConditionPathExists=/etc/repart.d
+After=systemd-fsck-root.service
+Before=local-fs-pre.target systemd-growfs-root.service shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/systemd-repart --dry-run=no
+
+[Install]
+WantedBy=sysinit.target
