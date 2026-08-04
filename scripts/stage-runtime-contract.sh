@@ -195,8 +195,17 @@ Name=mgmt
 DHCP=yes
 IPv6AcceptRA=true
 
+# No RouteMetric. D1 removes data's ELIGIBILITY for a default route
+# (`UseRoutes=false`/`UseGateway=false` on 32-data.network), it does not rank
+# mgmt above it -- so there is nothing left here to out-rank. The metric was the
+# LIVE workaround applied to the fleet on 2026-08-01 after data won egress and
+# blacked the segment out for 286s; carrying it into the image would keep a
+# ranking knob for a competitor that can no longer exist, and invite the next
+# routing problem to be "fixed" by tuning metrics -- which is the mechanism that
+# failed. Same reasoning that already deleted this bond's reselect policy and
+# the data bridge's PVID: inert settings read as active policy.
+# Ruled 2026-08-04; docs/architecture.md records it deleted on both planes.
 [DHCPv4]
-RouteMetric=500
 UseDomains=true
 UseDNS=true
 
