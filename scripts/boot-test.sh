@@ -954,10 +954,50 @@ assert_serial() { # $1 = mode, $2 = size
 	return 0
 }
 
-g() { ssh_run "$SHIP_KEY" "$RUN_SSH" "$SHIP_USER" "$@" 2>/dev/null; }
+# 🔴 THE PATH IS SET EXPLICITLY, and this is the whole reason the T3 tier's first
+# ever execution reported a false "15 FAILED -- the artifact is NOT validated".
+#
+# sshd runs a non-interactive command with a DEFAULT PATH that excludes
+# /usr/sbin, and it does not read /etc/profile. SHIP_USER is not root. So every
+# assertion reaching for a binary in /usr/sbin got "command not found", which
+# this function's `2>/dev/null` swallowed, and the empty output was then read as
+# a statement about the ARTIFACT:
+#
+#   swapon   /usr/sbin -> "swap is active at first boot"            FAIL
+#   modprobe /usr/sbin -> "mlxsw_spectrum resolves for the kernel"  FAIL
+#   dkms     /usr/sbin -> "dkms reports mlxsw installed"            FAIL
+#
+# All three artifact claims were TRUE at the time. The serial log carries
+# `Adding 2097148k swap on /swapfile` and `Finished switch-swapfile.service`,
+# and the running kernel was 6.12.100+deb13-amd64, which carries mlxsw. The
+# correlation is exact and it is the diagnosis: every assertion that PASSED
+# calls a binary in /usr/bin, every one that FAILED calls one in /usr/sbin.
+#
+# This is the project's signature class in its most expensive form -- not a
+# check that silently never runs, but a check that runs, measures the harness,
+# and reports the answer as a property of the thing under test.
+g() {
+	ssh_run "$SHIP_KEY" "$RUN_SSH" "$SHIP_USER" \
+		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; export PATH; $*" 2>/dev/null
+}
 
 assert_online() { # $1 = mode, $2 = size
 	local mode="$1" size="$2" v
+
+	# 🔴 DEPENDENCY PREFLIGHT, and it exists so the PATH defect above can never
+	# recur SILENTLY. Fixing g()'s PATH fixes today's three call sites; it does
+	# nothing for the next assertion someone writes against a /usr/sbin binary.
+	# This names the tools the tier depends on and fails ONCE, loudly, about the
+	# HARNESS -- instead of letting each missing tool masquerade as a separate
+	# defect in the artifact. A tier that cannot run its own commands must say so
+	# in those words.
+	local miss
+	miss="$(g 'for c in swapon modprobe dkms systemctl networkctl ip lsblk df ssh-keygen lsmod test; do command -v $c >/dev/null 2>&1 || printf "%s " "$c"; done')"
+	if [ -z "$miss" ]; then
+		ok "$RUN_TAG: every command the T3 tier runs is resolvable as $SHIP_USER (sshd's non-interactive PATH excludes /usr/sbin)"
+	else
+		bad "$RUN_TAG: the T3 tier cannot resolve: $miss-- these are HARNESS failures, not artifact defects. Every assertion below that uses one is meaningless."
+	fi
 
 	# 🔴 UNCONDITIONALLY empty. No allowlist, ever: a unit that cannot succeed
 	# in QEMU must be CONDITIONED by its owning member so systemd reports it
@@ -1404,6 +1444,14 @@ do_selftest() {
 	has 'ConditionResult --value switch-firstboot' \
 		"the trigger is read from systemd's OWN verdict at runtime -- the check whose absence let a correct-looking, never-running unit ship"
 	has 'switch-firstboot.stamp' "the offline tier asserts the first-boot stamp does not ship in the artifact"
+	# 🔴 THE /usr/sbin TRAP. sshd's non-interactive PATH has no /usr/sbin and
+	# SHIP_USER is not root, so swapon, modprobe and dkms were "command not
+	# found" -- and g()'s 2>/dev/null turned that into three FAILs about the
+	# ARTIFACT on the tier's first ever execution.
+	has 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin' \
+		"T3 sets an explicit PATH (sshd's non-interactive PATH excludes /usr/sbin and SHIP_USER is not root)"
+	has 'command -v \$c' \
+		"T3 preflights that its own commands resolve, so a missing tool fails ONCE about the harness instead of masquerading as artifact defects"
 
 	# --- the growth branches really differ
 	local b
