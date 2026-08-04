@@ -450,22 +450,61 @@ grep -q "^${SHIP_USER:-johns}:" "$M/etc/passwd" 2>/dev/null && P "the shipped ad
 ls "$M"/etc/ssh/ssh_host_*_key >/dev/null 2>&1 && F "SSH host keys were removed by generalize" || P "SSH host keys were removed by generalize"
 
 # ------------------------------------------------------------ kernel + mlxsw (BUILD GATE)
-KT=$(ls -1 "$M/lib/modules" 2>/dev/null | wc -l)
-VZ=$(ls -1 "$M"/boot/vmlinuz-* 2>/dev/null | wc -l)
-if [ "$KT" -eq 1 ]; then P "exactly one kernel module tree ships ($KT)"
-else F "exactly one kernel module tree ships -- found $KT: $(ls -1 "$M/lib/modules" | tr '\n' ' ')"; fi
-if [ "$VZ" -eq 1 ]; then P "exactly one kernel image ships ($VZ)"
-else F "exactly one kernel image ships -- found $VZ: $(ls -1 "$M"/boot/vmlinuz-* | sed 's|.*/||' | tr '\n' ' ')"; fi
+#
+# 🔴 RULING REVERSED BY THE OPERATOR, 2026-08-04. The earlier ruling was "FAIL
+# on the presence of any second kernel at all". It is withdrawn: a kernel
+# WITHOUT mlxsw is a deliberate RESCUE KERNEL, kept on purpose. Its value is
+# precisely that it lacks the driver -- it is the kernel that still boots when a
+# DKMS rebuild goes wrong or the ASIC itself wedges, which is exactly when you
+# need a shell to inspect a failed boot. Debian's own fail-safe-kernel
+# convention did not arise by accident.
+#
+# So the gate is no longer about COUNT. It is about SELECTION: a rescue kernel
+# is safe only while nothing can reach it automatically.
+GC="$M/boot/grub/grub.cfg"
+DEFK=$(awk '/^menuentry /{f=1} f&&/^[[:space:]]*linux[[:space:]]/{print; exit}' "$GC" 2>/dev/null | sed -n 's/.*vmlinuz-\([^ ]*\).*/\1/p')
+LKG=$(sed -n 's/^KERNEL=//p' "$M/var/lib/mlxsw-fallback/last-known-good" 2>/dev/null)
+has_mlxsw() { # $1 = kernel version. 🔴 GLOB *.ko* -- trixie ships .ko.xz and a
+              # bare *.ko glob finds ZERO while printing green.
+  [ "$(ls -1 "$M/lib/modules/$1/updates/dkms/"mlxsw*.ko* 2>/dev/null | wc -l)" -gt 0 ]
+}
 
-# Every kernel that ships must carry mlxsw, not merely the default one: a
-# portless kernel one menu selection away is a live R4 hazard.
+WITH=""; WITHOUT=""
 for k in $(ls -1 "$M/lib/modules" 2>/dev/null); do
-  # 🔴 GLOB *.ko* -- trixie ships .ko.xz. A *.ko glob finds ZERO and prints green.
-  c=$(ls -1 "$M/lib/modules/$k/updates/dkms/"mlxsw*.ko* 2>/dev/null | wc -l)
-  if [ "$c" -gt 0 ]; then P "kernel $k ships mlxsw modules ($c)"
-  else F "kernel $k ships NO mlxsw modules -- booting it yields a switch with zero ports"; fi
+  if has_mlxsw "$k"; then WITH="$WITH $k"; else WITHOUT="$WITHOUT $k"; fi
 done
-KVER=$(ls -1 "$M/lib/modules" 2>/dev/null | sort -V | tail -1)
+[ -n "$WITH" ] && P "at least one shipped kernel carries mlxsw ($WITH )" \
+               || F "at least one shipped kernel carries mlxsw -- NONE do"
+[ -n "$WITHOUT" ] && NT "rescue kernel(s) present, by design, reachable only by hand:$WITHOUT" \
+                  || NT "no rescue kernel ships (permitted, not required)"
+
+# 1. What boots UNATTENDED must have the driver.
+if [ -z "$DEFK" ]; then F "the default GRUB entry names a kernel"
+elif has_mlxsw "$DEFK"; then P "the DEFAULT boot kernel carries mlxsw ($DEFK)"
+else F "the DEFAULT boot kernel carries mlxsw -- $DEFK has none, so an unattended boot yields zero ports"; fi
+
+# 2. What the R4 ladder can ARM must have the driver. A rescue kernel reachable
+#    by grub-reboot is not a rescue kernel, it is a silent portless boot.
+if [ -z "$LKG" ]; then F "last-known-good names a kernel"
+elif has_mlxsw "$LKG"; then P "last-known-good names a kernel WITH mlxsw ($LKG)"
+else F "last-known-good names a kernel WITH mlxsw -- it names $LKG, which has none: the fallback ladder can arm a portless boot"; fi
+
+# 3. The rescue kernel must not be the default under any spelling.
+for k in $WITHOUT; do
+  [ "$k" = "$DEFK" ] && F "rescue kernel $k is not the default" || P "rescue kernel $k is not the default"
+  [ "$k" = "$LKG" ]  && F "rescue kernel $k is not last-known-good" || P "rescue kernel $k is not last-known-good"
+  # 🔴 unattended-upgrades ships ENABLED and its Remove-Unused-Kernel-Packages
+  # default is true. apt protects only the running and previous kernels, so the
+  # rescue kernel survives today and is silently autoremoved at the SECOND
+  # kernel upgrade -- unless it is marked manually installed, which takes it out
+  # of the autoremove set permanently.
+  if grep -q "^Package: linux-image-$k\$" "$M/var/lib/apt/extended_states" 2>/dev/null; then
+    if awk -v k="linux-image-$k" '$1=="Package:"&&$2==k{f=1} f&&$1=="Auto-Installed:"{print $2; exit}' "$M/var/lib/apt/extended_states" | grep -qx 1; then
+      F "rescue kernel $k is marked MANUALLY installed (else unattended-upgrades autoremoves it at the 2nd kernel upgrade)"
+    else P "rescue kernel $k is marked MANUALLY installed"; fi
+  else P "rescue kernel $k is marked MANUALLY installed"; fi
+done
+KVER="${DEFK:-$(ls -1 "$M/lib/modules" 2>/dev/null | sort -V | tail -1)}"
 for m in mlxsw_core mlxsw_pci mlxsw_spectrum mlxsw_i2c mlxsw_minimal objagg parman; do
   ls "$M/lib/modules/$KVER/updates/dkms/$m".ko* >/dev/null 2>&1 && P "module $m present for $KVER" || F "module $m present for $KVER"
 done
@@ -1120,8 +1159,19 @@ do_selftest() {
 	grep -q "printf 'R\\\\tEND" "$ST_TMP/payload.sh" && sok "the payload emits a terminator" || sbad "the payload emits a terminator"
 	grep -q 'set -e' "$ST_TMP/payload.sh" && sbad "the payload does not set -e (every assertion must run)" || sok "the payload does not set -e (every assertion must run)"
 	grep -q 'mount -o ro' "$ST_TMP/payload.sh" && sok "the payload mounts the artifact read-only" || sbad "the payload mounts the artifact read-only"
-	grep -q 'ls -1 "$M/lib/modules" 2>/dev/null | wc -l' "$ST_TMP/payload.sh" \
-		&& sok "the payload gates on exactly one kernel tree" || sbad "the payload gates on exactly one kernel tree"
+	# 🔴 The kernel gate is about SELECTION, not COUNT (ruling reversed
+	# 2026-08-04: a driverless RESCUE kernel is deliberate). These four must all
+	# be present or the rescue kernel stops being safe.
+	grep -q 'the DEFAULT boot kernel carries mlxsw' "$ST_TMP/payload.sh" \
+		&& sok "the payload gates on the DEFAULT kernel carrying mlxsw" || sbad "the payload gates on the DEFAULT kernel carrying mlxsw"
+	grep -q 'last-known-good names a kernel WITH mlxsw' "$ST_TMP/payload.sh" \
+		&& sok "the payload gates on the R4 ladder never arming a driverless kernel" || sbad "the payload gates on the R4 ladder never arming a driverless kernel"
+	grep -q 'is not the default' "$ST_TMP/payload.sh" \
+		&& sok "the payload asserts the rescue kernel is not auto-selectable" || sbad "the payload asserts the rescue kernel is not auto-selectable"
+	grep -q 'marked MANUALLY installed' "$ST_TMP/payload.sh" \
+		&& sok "the payload asserts the rescue kernel survives unattended-upgrades" || sbad "the payload asserts the rescue kernel survives unattended-upgrades"
+	grep -q 'exactly one kernel module tree' "$ST_TMP/payload.sh" \
+		&& sbad "the payload no longer fails on a second kernel (ruling withdrawn)" || sok "the payload no longer fails on a second kernel (ruling withdrawn)"
 
 	# --- the serial de-escaper, proven by OUTCOME on a real systemd line
 	# 🔴 A behavioural test, not a source grep. Three assertions in this file
@@ -1271,12 +1321,78 @@ report() {
 	return 0
 }
 
+# ---------------------------------------------------------------- interactive
+#
+# 🔴 THE IMAGE ALREADY SUPPORTS BOTH CONSOLES. Measured on the artifact: the
+# generated command line carries `console=tty0 console=ttyS0,115200` -- BOTH --
+# and `getty@tty1.service` (the VGA text console) is enabled, alongside the
+# serial getty systemd spawns because ttyS0 is the last console= token. Enabling
+# serial did not disable VGA.
+#
+# What hides the VGA console is THIS HARNESS: the automated tiers pass
+# `-display none` because they are unattended and assert on a serial FILE. That
+# is a harness choice, not a property of the image, and it is the whole reason
+# there appeared to be no way in. This subcommand is the documented way in.
+do_console() {
+	discover_image
+	need qemu-system-x86_64; need qemu-img
+	local mode="${MODE:-bios}"
+	run_scope "console-$mode" 6
+	rm -f "$RUN_DIR/disk.qcow2"
+	qemu-img create -q -f qcow2 -b "$IMAGE" -F raw "$RUN_DIR/disk.qcow2" "${GROWN_SIZE}" \
+		|| die "could not create the overlay"
+
+	local -a fw=()
+	if [ "$mode" = uefi ]; then
+		[ -r "$OVMF_CODE" ] || die "no OVMF_CODE at $OVMF_CODE"
+		cp -f "$OVMF_VARS" "$RUN_DIR/OVMF_VARS.fd"; chmod u+w "$RUN_DIR/OVMF_VARS.fd"
+		fw=(-drive if=pflash,format=raw,unit=0,readonly=on,file="$OVMF_CODE"
+		    -drive if=pflash,format=raw,unit=1,file="$RUN_DIR/OVMF_VARS.fd")
+	fi
+
+	cat <<-EOM
+
+	Booting the artifact interactively (${mode^^}), on a DISPOSABLE overlay --
+	the artifact file itself is never written.
+
+	  serial console : this terminal (you are attached to it now)
+	  VGA console    : ${DISPLAY_MODE:-none -- re-run with DISPLAY_MODE=gtk for a window}
+	  ssh            : ssh -i $SHIP_KEY -p $RUN_SSH $SHIP_USER@127.0.0.1
+	  quit qemu      : Ctrl-a x        (serial is on a qemu multiplexer)
+	  qemu monitor   : Ctrl-a c
+
+	⚠ Console LOGIN needs a password, and this image is SSH-key-only by design,
+	  so no account has one. Until fix-switch-firstboot-never-fires lands, sshd
+	  cannot start either -- so this session is for WATCHING the boot and using
+	  the GRUB menu, not for logging in. Interrupt GRUB to reach the rescue
+	  kernel or a root shell (init=/bin/sh).
+
+	EOM
+
+	# -serial mon:stdio, not -serial file: this is the interactive path. `mon:`
+	# multiplexes the qemu monitor onto the same terminal so Ctrl-a x can end a
+	# guest that never reaches a prompt.
+	qemu-system-x86_64 \
+		-enable-kvm -machine q35 -cpu host \
+		-m "$MEM" -smp "$CPUS" \
+		"${fw[@]}" \
+		-smbios type=1,manufacturer="$DMI_VENDOR",product="$DMI_PRODUCT",serial="$DMI_SERIAL" \
+		-drive file="$RUN_DIR/disk.qcow2",if=none,id=root,format=qcow2 \
+		-device virtio-blk-pci,drive=root,bootindex=0 \
+		-netdev user,id=n0,hostfwd=tcp:127.0.0.1:"$RUN_SSH"-:22 \
+		-device e1000e,netdev=n0 \
+		-display "${DISPLAY_MODE:-none}" -serial mon:stdio
+}
+
 usage() {
 	sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
 	printf '\nCommands:\n'
 	printf '  offline    T1 only -- inspector VM, artifact attached read-only\n'
 	printf '  boot       T2+T3 only -- four boots: {BIOS,UEFI} x {native,grown}\n'
 	printf '  all        offline, then boot (default)\n'
+	printf '  console    boot the artifact INTERACTIVELY on a disposable overlay,\n'
+	printf '             serial attached to this terminal (Ctrl-a x to quit).\n'
+	printf '             MODE=uefi for the UEFI path; DISPLAY_MODE=gtk for a VGA window.\n'
 	printf '  selftest   offline proof of the harness itself: no VM, no root\n'
 }
 
@@ -1285,6 +1401,7 @@ case "${1:-all}" in
 offline)  trap cleanup_all EXIT INT TERM; do_offline; report ;;
 boot)     trap cleanup_all EXIT INT TERM; do_boot;    report ;;
 all)      trap cleanup_all EXIT INT TERM; do_offline; do_boot; report ;;
+console)  do_console ;;
 selftest) do_selftest ;;
 -h|--help|help) usage ;;
 *) usage; exit 2 ;;
