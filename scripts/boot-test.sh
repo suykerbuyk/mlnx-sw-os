@@ -494,9 +494,13 @@ gone /var/lib/switch-firstboot.stamp \
   || F "a first-boot stamp SHIPS in the artifact -- switch-firstboot will be skipped and this image is unreachable"
 # The unit must no longer carry the directive that failed. Checked on the
 # INSTALLED unit, not on the repo asset: what ships is what matters.
-grep -q 'ConditionFirstBoot' "$M/etc/systemd/system/switch-firstboot.service" 2>/dev/null \
-  && F "the shipped switch-firstboot.service carries no ConditionFirstBoot (it evaluates false here)" \
-  || P "the shipped switch-firstboot.service carries no ConditionFirstBoot (it evaluates false here)"
+# ⚠ ANCHORED to a DIRECTIVE, not the word. The unit's header explains at length
+# why ConditionFirstBoot was deleted, so a bare grep FAILs against a correct
+# file -- the project's comment-matching-grep defect, which this very assertion
+# committed and `stage-generalize verify` caught on the rebuild.
+grep -qE '^[[:space:]]*ConditionFirstBoot' "$M/etc/systemd/system/switch-firstboot.service" 2>/dev/null \
+  && F "the shipped switch-firstboot.service carries no ConditionFirstBoot directive (it evaluates false here)" \
+  || P "the shipped switch-firstboot.service carries no ConditionFirstBoot directive (it evaluates false here)"
 grep -qx 'ConditionPathExists=!/var/lib/switch-firstboot.stamp' "$M/etc/systemd/system/switch-firstboot.service" 2>/dev/null \
   && P "the shipped switch-firstboot.service is conditioned on the stamp's absence" \
   || F "the shipped switch-firstboot.service is not conditioned on the stamp"

@@ -657,9 +657,15 @@ do_verify() {
 	fi
 	# The old mechanism must be gone from the unit as SHIPPED IN THE GUEST, not
 	# merely from the asset in the repo.
-	grep -q 'ConditionFirstBoot' /etc/systemd/system/switch-firstboot.service \
-		&& bad "the installed switch-firstboot.service still carries ConditionFirstBoot -- it evaluates false on the artifact" \
-		|| ok "the installed switch-firstboot.service carries no ConditionFirstBoot"
+	# ⚠ ANCHORED, so it matches a DIRECTIVE and not a COMMENT. The bare
+	# `grep -q 'ConditionFirstBoot'` this replaced reported FAIL against a
+	# perfectly correct unit, because that file's header explains at length why
+	# the directive was deleted -- the project's comment-matching-grep bug,
+	# committed inside the fix for it and caught by running verify. systemd
+	# directives cannot be indented behind a '#', so ^[[:space:]]* is exact.
+	grep -qE '^[[:space:]]*ConditionFirstBoot' /etc/systemd/system/switch-firstboot.service \
+		&& bad "the installed switch-firstboot.service still carries a ConditionFirstBoot DIRECTIVE -- it evaluates false on the artifact" \
+		|| ok "the installed switch-firstboot.service carries no ConditionFirstBoot directive"
 
 	echo "== swap (AD-4: a FILE, never a partition) =="
 	[ -x /usr/local/sbin/switch-swapfile ] && ok "/usr/local/sbin/switch-swapfile present" \
