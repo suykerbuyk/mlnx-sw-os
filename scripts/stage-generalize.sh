@@ -1794,6 +1794,17 @@ do_selftest() {
 
 	# switch-firstboot.service -- identity only, Condition never Assert.
 	grep -qx 'ConditionFirstBoot=yes' "$FU" && ok "switch-firstboot.service uses ConditionFirstBoot=yes" || bad "switch-firstboot.service has no ConditionFirstBoot=yes"
+	# 🔴 A unit ordered Before=systemd-networkd.service MUST NOT also carry the
+	# implicit After=basic.target that DefaultDependencies adds: networkd is
+	# needed before basic.target, so the two close an ordering cycle. Measured on
+	# a real boot 2026-08-03 -- systemd broke it by DELETING a job, and which job
+	# it deletes is not predictable. Any unit with the Before= edge needs this.
+	grep -qx 'DefaultDependencies=no' "$FU" \
+		&& ok "switch-firstboot.service sets DefaultDependencies=no (its Before=networkd edge would otherwise close an ordering cycle)" \
+		|| bad "switch-firstboot.service keeps the implicit After=basic.target AND orders itself before networkd -- that is an ordering cycle"
+	grep -qx 'Conflicts=shutdown.target' "$FU" \
+		&& ok "and it re-adds the shutdown conflict that DefaultDependencies=no removes" \
+		|| bad "DefaultDependencies=no without Conflicts=shutdown.target leaves the unit running into shutdown"
 	forbid_in "$FU" '^[[:space:]]*Assert' \
 		"switch-firstboot.service uses an Assert* directive (a failed Assert marks the unit FAILED; the project asserts 'systemctl --failed' empty with no allowlist ever)"
 	forbid_in "$SU" '^[[:space:]]*Assert' "switch-swapfile.service uses an Assert* directive"

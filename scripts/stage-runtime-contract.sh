@@ -590,19 +590,32 @@ REQUIRED_IMAGE=(
 
 # Operator preference. Nothing here is load-bearing.
 #
-# `ipmiutil` is the operator's pick for out-of-band management, RESOLVED iter 13
-# and measured against the real trixie archive:
+# 🔴 `ipmiutil` WAS HERE AND WAS DROPPED, operator ruling 2026-08-03, after the
+# first run of this stage against a real guest. It installs
+# `ipmiutil_wdt.service`, ENABLED BY THE PACKAGE'S OWN PRESET, which starts an
+# IPMI watchdog timer and keeps it fed from cron. On a machine with no BMC it
+# exits 240 immediately:
 #
-#     ipmitool   1.8.19-9   "utility for IPMI control with kernel driver or LAN"
-#     ipmiutil   3.2.1-1    "IPMI management utilities"
-#     ipmiutils  -- no stanza at all; the name does not exist
+#     × ipmiutil_wdt.service - ipmiutil Watchdog Timer Service using cron
+#          Active: failed (Result: exit-code)
+#         Main PID: 2421 (code=exited, status=240/LOGS_DIRECTORY)
+#     $ ls /dev/ipmi*  ->  No such file or directory
 #
-# ⚠ The two singular names are DIFFERENT PROJECTS, not spellings of each other,
-# and BOTH exist. The original request was "ipmiutils", which is neither. The
-# operator picked `ipmiutil`. Recorded because the pick was made on the stated
-# premise that `ipmitool` does not exist -- it does, and it is the more common
-# of the two -- so revisiting this is a preference change, not a bug fix.
-PREFERRED=(vim rsync wget tmux kitty-terminfo lm-sensors dmidecode ipmiutil)
+# That is a PERMANENTLY failed unit in the shipped artifact, on any machine
+# without a BMC -- not a QEMU artefact -- and ruling 6 says `systemctl --failed`
+# is empty unconditionally, no allowlist ever.
+#
+# Conditioning the unit was the other option and was NOT taken. It would have
+# left the watchdog LIVE on hardware that does have a BMC, and an IPMI watchdog
+# that stops being fed reboots the box -- a behaviour nobody asked for on a
+# production switch, arriving as a side effect of wanting the CLI tools.
+#
+# ⚠ For the record, since the original pick rested on a false premise: the two
+# singular names are DIFFERENT PROJECTS and BOTH exist in trixie --
+# `ipmitool 1.8.19-9` and `ipmiutil 3.2.1-1`. The original request was
+# "ipmiutils", which is neither. If out-of-band management is wanted later, that
+# is a fresh decision with this evidence in hand, not a restoration of this line.
+PREFERRED=(vim rsync wget tmux kitty-terminfo lm-sensors dmidecode)
 
 # Filled in by check_package_names(): the preference names this archive actually
 # has. Declared here so `set -u` cannot trip over it on any path.
@@ -639,12 +652,21 @@ PREFERRED_OK=()
 # watches fail. A4 writes a whole file for its own stated reason: the shipped
 # assets/sensor.modules.patch is a bookworm-vintage diff whose context lines
 # come from bookworm's /etc/modules and would fuzz or reject on trixie.
+#
+# ✅ `ipmiutil` WAS ADDED HERE 2026-08-03, moving OUT of PREFERRED by operator
+# ruling. It satisfies the rule above -- nothing else on the image drags it in,
+# so the absence assertion is satisfiable -- and it earns its place rather than
+# merely being deleted from PREFERRED: dropping a name from a preference list
+# is silent, and a later manifest edit could re-add it without anyone noticing
+# the failed watchdog unit come back. Here, `verify` says so on every run.
+# Full reasoning at the PREFERRED array.
 EXCLUDED=(
 	fancontrol
 	policykit-1
 	ntp ntpdate ntp-doc ntpsec
 	isc-dhcp-client
 	smbios-utils
+	ipmiutil
 )
 
 # 🔴 A DIFFERENT CLAIM WITH A DIFFERENT OWNER, and it must not be smuggled into
@@ -1844,17 +1866,25 @@ do_selftest() {
 	printf '%s\n' "${PREFERRED[@]}" | list_has_none_of "${REQUIRED_BUILD[@]}" "${REQUIRED_IMAGE[@]}" \
 		&& ok "no operator preference is hiding inside the required sets" \
 		|| bad "a package appears in both a REQUIRED set and PREFERRED"
-	# RESOLVED iter 13. `ipmiutil` is the operator's pick and is now a plain
-	# preference; the nonexistent `ipmiutils` must never reappear anywhere.
-	install_list | list_has ipmiutil && ok "ipmiutil is in the install list (the operator's out-of-band pick)" \
-	                                 || bad "ipmiutil is missing from the install list"
-	printf 'ipmiutils\n' | list_has_none_of $(install_list) \
-		&& ok "the nonexistent name 'ipmiutils' is NOT in the install list" \
-		|| bad "'ipmiutils' would be handed to apt -- it does not exist and would fail the whole transaction"
+	# 🔴 REVERSED 2026-08-03. This block used to assert that `ipmiutil` IS in the
+	# install list. It was dropped by operator ruling after the first run against
+	# a real guest: it ships ipmiutil_wdt.service enabled by its own preset,
+	# which exits 240 with no BMC and leaves a permanently failed unit in the
+	# artifact. The assertion is inverted rather than deleted, because "we
+	# removed it" is a claim that rots quietly -- a future manifest edit that
+	# re-adds the package must fail here and be made to argue its case again.
+	install_list | list_has_none_of ipmiutil \
+		&& ok "ipmiutil is NOT in the install list (it ships an enabled watchdog unit that fails with no BMC)" \
+		|| bad "ipmiutil is back in the install list -- it fails ruling 6 on any machine without a BMC"
+	# Neither singular name may reappear by the other spelling, and the
+	# nonexistent plural must never appear at all.
+	install_list | list_has_none_of ipmitool \
+		&& ok "ipmitool is not silently substituted (a different project; re-adding IPMI is a fresh decision)" \
+		|| bad "ipmitool appeared without a ruling"
 	# ⚠ NO SOURCE GREP HERE, deliberately. A `^[^#]*ipmiutils` guard flags its own
-	# must-fail fixture on the line above -- the same self-matching trap that
-	# retired the versioned-headers source grep. The outcome check IS the guard:
-	# what matters is that the name never reaches apt, not that it never appears.
+	# must-fail fixture -- the same self-matching trap that retired the
+	# versioned-headers source grep. The outcome check IS the guard: what matters
+	# is that the name never reaches apt, not that it never appears.
 	install_list | list_has_none_of ipmiutils \
 		&& ok "no nonexistent ipmi name can reach apt (checked by outcome, not by source grep)" \
 		|| bad "a nonexistent ipmi name is in the install list"

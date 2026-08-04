@@ -19,12 +19,40 @@
 # Ordering edges naming units that do not exist on a given distro -- ssh.service
 # on Arch, sshd.service on Debian -- are inert, which is what makes one file
 # work on both.
+#
+# 🔴 DefaultDependencies=no IS LOAD-BEARING, added 2026-08-03 after a real boot.
+# With the default dependencies systemd adds an implicit After=basic.target,
+# and this unit also declares Before=systemd-networkd.service -- but networkd is
+# needed BEFORE basic.target, so the two edges close a loop. Measured:
+#
+#   sysinit.target: Found ordering cycle on cloud-init-network.service/start
+#   sysinit.target: Found dependency on systemd-networkd-wait-online.service/start
+#   sysinit.target: Found dependency on systemd-networkd.service/start
+#   sysinit.target: Found dependency on switch-firstboot.service/start
+#   sysinit.target: Found dependency on basic.target/start
+#   ...
+#   Job cloud-init-network.service/start DELETED to break ordering cycle
+#
+# 🔴 The damage is not the cycle, it is the RESOLUTION: systemd breaks a cycle by
+# DELETING A JOB, and which job it picks is not something this project controls
+# or can predict. Here it deleted cloud-init-network.service, which is harmless
+# only by luck -- cloud-init is purged from the artifact anyway. With that unit
+# gone the same loop is still there, and systemd would delete some OTHER job to
+# break it, silently, at boot, on a switch. A boot that quietly drops
+# systemd-networkd is a switch that never comes back.
+#
+# So the implicit ordering is dropped and the edges this unit actually needs are
+# stated explicitly. That is the same shape switch-growroot.service already uses,
+# and for the same reason.
 [Unit]
 Description=Switch first-boot identity (hostname, SSH host keys, machine-id)
 Documentation=man:machine-id(5) man:ssh-keygen(1)
+DefaultDependencies=no
 ConditionFirstBoot=yes
 After=systemd-remount-fs.service
 Before=systemd-networkd.service systemd-user-sessions.service ssh.service sshd.service
+Before=shutdown.target
+Conflicts=shutdown.target
 
 [Service]
 Type=oneshot
