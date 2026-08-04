@@ -1,32 +1,41 @@
-# FALLBACK ONLY -- normally NOT installed.
+# The growth unit. ALWAYS installed, and it REPLACES the shipped
+# systemd-repart.service, which stage-generalize masks.
 #
-# scripts/stage-generalize.sh prefers the SHIPPED systemd-repart.service and
-# installs this file only when the shipped unit cannot be relied on in the
-# guest (masked, not wanted by sysinit.target, or systemd-growfs-root.service
-# does not order itself After=systemd-repart.service).
+# 🔴 THIS HEADER PREVIOUSLY SAID THE OPPOSITE -- "FALLBACK ONLY, normally NOT
+# installed" -- because the shipped unit was believed to solve the ordering for
+# free. The ordering claim was, and still is, TRUE: systemd-growfs-root.service
+# carries After=systemd-repart.service and the shipped unit has a static wants
+# symlink in sysinit.target.wants. That is not why it was rejected.
 #
-# Why the shipped unit is preferred: upstream systemd already solves the
-# ordering this unit exists to force. systemd-growfs@.service and
-# systemd-growfs-root.service both carry `After=systemd-repart.service`, and
-# systemd-repart.service ships a static wants symlink in
-# /usr/lib/systemd/system/sysinit.target.wants/ -- so the filesystem grow
-# already waits for the partition grow, on the same boot, with nothing of ours
-# in the picture. Read off systemd 261 on the build host; the guest must
-# confirm the same for Debian's systemd 257 (see the script's `verify` phase).
+# It was rejected on a different fact, found by running it: on a disk with NO
+# FREE SPACE, `systemd-repart` exits 1 --
 #
-# [Unit] below is verbatim from the proven configuration recorded in the task.
-# Two deliberate divergences, both flagged rather than silently applied:
-#   - [Install] is added; the recorded text had none, and `systemctl enable`
-#     cannot enable a unit with no [Install] section.
-#   - SuccessExitStatus=76/77 is NOT copied from the shipped unit. 76 is "no
-#     root block device" and 77 is "no GPT partition table"; on this artifact
-#     both are genuine failures worth surfacing in `systemctl --failed`.
+#   systemd-repart[361]: Can't fit requested partitions into available free space (0B), refusing.
+#   systemd[1]: systemd-repart.service: Failed with result 'exit-code'.
 #
-# UNVERIFIED: this unit has never been booted with this [Install] section. The
-# Before=local-fs-pre.target edge plus WantedBy=sysinit.target is a shape that
-# can produce an ordering cycle (sysinit.target is After=local-fs.target).
-# If this fallback is ever selected, boot the guest once and assert the journal
-# contains no "Found ordering cycle" before shipping anything built with it.
+# -- so the shipped unit lands in `systemctl --failed` on every boot of an
+# already-grown switch, and on every boot-test at native size. Measured
+# 2026-08-03. The epic's recorded "systemd-repart exits 0 on no-change" is
+# false, and growpart's exit-1-means-two-things trap was never deleted; it
+# moved here.
+#
+# Replacing the unit does not lose upstream's ordering: the
+# Before=systemd-growfs-root.service edge below states it explicitly, so the
+# filesystem grow still waits for the partition grow on the same boot.
+#
+# ExecStart is /usr/local/sbin/switch-growroot, NOT systemd-repart directly.
+# That wrapper tolerates "nothing to grow" and nothing else -- see its own
+# header for why a `-` prefix was rejected.
+#
+# SuccessExitStatus=76/77 is deliberately NOT copied from the shipped unit. 76
+# is "no root block device" and 77 is "no GPT partition table"; on this artifact
+# both are genuine failures worth surfacing in `systemctl --failed`.
+#
+# ⚠ UNVERIFIED UNTIL BOOTED: the Before=local-fs-pre.target edge plus
+# WantedBy=sysinit.target is a shape that can produce an ordering cycle
+# (sysinit.target is After=local-fs.target). stage-generalize's `verify` asserts
+# the journal carries no "Found ordering cycle"; that assertion is the gate, not
+# this comment.
 [Unit]
 Description=Grow the root partition to fill the disk
 DefaultDependencies=no
@@ -38,7 +47,7 @@ Conflicts=shutdown.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/bin/systemd-repart --dry-run=no
+ExecStart=/usr/local/sbin/switch-growroot
 
 [Install]
 WantedBy=sysinit.target

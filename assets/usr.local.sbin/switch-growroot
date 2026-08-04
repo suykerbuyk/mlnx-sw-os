@@ -1,0 +1,62 @@
+#!/bin/sh
+# Grow the root partition to fill the disk, tolerating "there is nothing to
+# grow" and NOTHING ELSE.
+#
+# 🔴 WHY THIS EXISTS. The epic recorded, as settled, that "systemd-repart exits
+# 0 on no-change, so the whole exit-code-handling requirement disappears from
+# the plan". Measured in the build guest on 2026-08-03, that is FALSE:
+#
+#   systemd-repart[361]: Can't fit requested partitions into available free space (0B), refusing.
+#   systemd-repart[361]: Automatically determined minimal disk image size as 8G, current image size is 8G.
+#   systemd[1]: systemd-repart.service: Main process exited, code=exited, status=1/FAILURE
+#
+# So `growpart`'s exit-1-means-two-things trap was never deleted. It moved to
+# the replacement mechanism unchanged, and it bites in exactly the case the epic
+# named for growpart: an image booting on a disk it already fills -- the
+# boot-test at native size, and every re-boot of an already-grown switch.
+#
+# 🔴 WHY IT CANNOT BE DECIDED AT BUILD TIME. Whether there is free space is a
+# property of the DISK THE ARTIFACT LANDS ON, not of the build guest. One image
+# boots on a 512 G SSD with 504 G free (grow) and on the boot-test's 8 G file
+# with 0 B free (nothing to grow). Both are correct outcomes for the same image,
+# so the tolerance has to live at runtime, here.
+#
+# 🔴 WHAT IS DELIBERATELY NOT TOLERATED. Anything else. The epic's own ruling on
+# the identical growpart trap was "tolerate exit 1 deliberately ... Do NOT
+# blanket-ignore failure: exit 2 is a genuine error and must still fail the unit
+# loudly." A `-` prefix on ExecStart, or a bare `|| true`, would swallow a real
+# growth failure -- and growth is what AD-4 depends on. Matching the one message
+# keeps a genuine fault loud.
+set -u
+
+# Absolute path in production -- a root-run wrapper should not depend on PATH.
+# SWITCH_REPART is a TEST SEAM and nothing else: the unit that runs this sets no
+# environment, so in the artifact this is always /usr/bin/systemd-repart. It
+# exists because the whole point of this script is its behaviour across
+# systemd-repart's exit statuses, and a check that can only be exercised by
+# filling a real disk is a check nobody runs.
+REPART="${SWITCH_REPART:-/usr/bin/systemd-repart}"
+
+out="$("$REPART" --dry-run=no 2>&1)"
+rc=$?
+
+[ -n "$out" ] && printf '%s\n' "$out"
+
+if [ "$rc" -eq 0 ]; then
+	exit 0
+fi
+
+# The ONE tolerated failure. Matched on systemd-repart's own message rather than
+# on the exit status, because the status alone cannot distinguish it from a real
+# fault -- which is the whole defect this script exists to contain.
+case "$out" in
+*"Can't fit requested partitions into available free space"*)
+	echo "switch-growroot: nothing to grow -- the root partition already fills the disk"
+	exit 0
+	;;
+esac
+
+echo "switch-growroot: systemd-repart FAILED (exit $rc) for a reason that is not" >&2
+echo "switch-growroot: 'no free space'. This is a real growth failure: AD-4's" >&2
+echo "switch-growroot: root-fills-the-disk guarantee does not hold on this boot." >&2
+exit "$rc"

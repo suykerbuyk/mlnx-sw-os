@@ -97,10 +97,24 @@ SERIAL="$WORK/serial.log"
 # filesystem.
 POWEROFF_TIMEOUT="${POWEROFF_TIMEOUT:-120}"
 
-# auto   -- use the shipped systemd-repart.service if the guest proves it will
-#           run, otherwise install assets/etc.systemd.system/switch-growroot.service
-# shipped/custom -- force one path, for a deliberate experiment
-GROW_UNIT="${GROW_UNIT:-auto}"
+# 🔴 THE SHIPPED-vs-CUSTOM CHOICE IS GONE, and so is GROW_UNIT. The custom unit
+# is always installed and the shipped systemd-repart.service is always masked.
+#
+# There used to be an `auto` probe choosing between them on four wiring facts,
+# and it chose `shipped` on this guest. The wiring facts were right and the
+# choice was wrong, because the disqualifying property is not wiring: on a disk
+# with no free space `systemd-repart` EXITS 1, so the shipped unit fails on
+# every boot of an already-grown switch. Measured 2026-08-03.
+#
+# The choice cannot be restored as a probe, either. Whether there is free space
+# is a property of THE DISK THE ARTIFACT LANDS ON, not of the build guest -- one
+# image boots on a 512 G SSD with room to grow and on the boot-test's 8 G file
+# with none, and both are correct. A build-time measurement cannot answer a
+# runtime question, so the tolerance lives at runtime in
+# /usr/local/sbin/switch-growroot and the decision here is unconditional.
+#
+# A `GROW_UNIT=shipped` escape hatch was NOT kept. Config that reads as live and
+# is known-broken is the shape this epic calls Critical everywhere else.
 
 # 1 (default): a failed precondition aborts. 0: preconditions WARN instead, and
 # the exported artifact is renamed NON-REPRESENTATIVE so a weakened run can
@@ -333,35 +347,23 @@ do_prepare() {
 # Debian's systemd 257 ships the same edges. That is what this probe checks,
 # IN the guest, instead of assuming either way.
 #
-# 🔴 THE PROBE AND THE DECISION ARE SEPARATE ON PURPOSE. The guest payload
-# gathers FACTS and prints them, one KEY=yes|no per line; grow_unit_verdict()
-# below is a pure predicate over that text and decides. A decision that lives
-# only inside a heredoc addressed to a machine which costs an hour to build is a
-# decision nobody can test, and this stage had never been run at all. The
-# host-side function is exercised in both polarities by `selftest`.
-GROW_FACT_KEYS="REPART_BINARY REPART_MASKED REPART_WANTEDBY_SYSINIT GROWFS_AFTER_REPART"
-
-# stdin = probe facts. Prints `shipped` or `custom`. Returns non-zero -- prints
-# nothing -- when any fact is missing or is not a yes/no, because a truncated
-# probe is not evidence for either answer and the caller must die rather than
-# guess. That is the same behaviour the earlier in-guest VERDICT= line had when
-# it failed to arrive; it is now reachable from a test.
-grow_unit_verdict() {
-	local facts k v verdict=shipped
-	facts="$(cat)"
-	for k in $GROW_FACT_KEYS; do
-		v="$(printf '%s\n' "$facts" | sed -n "s/^$k=//p" | tail -1)"
-		case "$v" in
-		yes|no) ;;
-		*) return 1 ;;
-		esac
-		case "$k=$v" in
-		REPART_BINARY=no|REPART_MASKED=yes|REPART_WANTEDBY_SYSINIT=no|GROWFS_AFTER_REPART=no)
-			verdict=custom ;;
-		esac
-	done
-	printf '%s\n' "$verdict"
-}
+# 🔴 grow_unit_verdict() WAS DELETED, along with GROW_FACT_KEYS. It was a pure,
+# well-tested predicate that decided between the shipped unit and the custom one
+# on four wiring facts -- and it was correct about the wiring and wrong about the
+# outcome, because the disqualifying property of the shipped unit is its EXIT
+# STATUS on a full disk, which no wiring fact can see. It chose `shipped` on this
+# guest and the artifact got a permanently failed unit.
+#
+# It is deleted rather than left with one branch unreachable: a well-tested
+# function nothing calls reads as live decision-making to the next person, and
+# its selftest assertions would keep passing while proving nothing about the
+# stage's actual behaviour.
+#
+# The probe below survives as DIAGNOSTICS ONLY. Its facts are printed and they
+# document the guest an artifact was built on; they decide nothing. The real
+# decision now lives at runtime in /usr/local/sbin/switch-growroot, which is
+# where a runtime question belongs -- and it is still a pure predicate over
+# text, so `selftest` still exercises it in both polarities.
 
 decide_grow_unit() {
 	local probe
@@ -386,39 +388,29 @@ decide_grow_unit() {
 	)
 	printf '%s\n' "$probe" | sed 's/^/       /'
 
-	local chosen verdict
-	case "$GROW_UNIT" in
-	auto)
-		verdict=$(printf '%s\n' "$probe" | grow_unit_verdict) \
-			|| die "the grow-unit probe returned no usable facts -- refusing to guess between \
-the shipped unit and the custom one. Re-run with GROW_UNIT=shipped or GROW_UNIT=custom only \
-if you have decided deliberately."
-		chosen="$verdict"
-		info "grow-unit probe verdict: $verdict" ;;
-	shipped|custom) chosen="$GROW_UNIT"; info "GROW_UNIT=$GROW_UNIT forces the '$chosen' path" ;;
-	*)       die "GROW_UNIT must be auto, shipped or custom (got '$GROW_UNIT')" ;;
-	esac
+	# The probe's facts are still printed above: they are useful diagnostics and
+	# they document the guest this artifact was built on. They no longer DECIDE
+	# anything -- see the GROW_UNIT note at the top of this file.
+	info "growth unit: CUSTOM switch-growroot.service (the shipped unit is masked)"
 
-	if [ "$chosen" = shipped ]; then
-		info "growth unit: SHIPPED systemd-repart.service (no custom unit installed)"
-		ssh_vm 'sudo sh -s' <<-'GUEST'
-		set -eu
-		# Idempotency: a previous run may have installed the fallback.
-		if [ -e /etc/systemd/system/switch-growroot.service ]; then
-			systemctl disable switch-growroot.service 2>/dev/null || true
-			rm -f /etc/systemd/system/switch-growroot.service
-			systemctl daemon-reload
-			echo "removed a stale switch-growroot.service"
-		fi
-		GUEST
-	else
-		warn "growth unit: CUSTOM switch-growroot.service -- the shipped unit did not \
-qualify. This path is UNVERIFIED: boot the guest once and assert the journal has no \
-'Found ordering cycle' before anything built this way is shipped."
-		push_file "$ASSETS/etc.systemd.system/switch-growroot.service" \
-			/etc/systemd/system/switch-growroot.service 0644
-		ssh_vm 'sudo sh -c "systemctl daemon-reload && systemctl enable switch-growroot.service"'
-	fi
+	push_file "$ASSETS/usr.local.sbin/switch-growroot" \
+		/usr/local/sbin/switch-growroot 0755
+	push_file "$ASSETS/etc.systemd.system/switch-growroot.service" \
+		/etc/systemd/system/switch-growroot.service 0644
+
+	ssh_vm 'sudo sh -s' <<-'GUEST'
+	set -eu
+	systemctl daemon-reload
+	systemctl enable switch-growroot.service
+
+	# 🔴 MASK, not disable. systemd-repart.service is `static` -- it has no
+	# [Install] section, so `disable` is a no-op on it: it is pulled in by a
+	# static wants symlink under /usr/lib, which only masking overrides. It
+	# would otherwise keep running alongside our unit, keep exiting 1 on a full
+	# disk, and keep the artifact permanently in `systemctl --failed`.
+	systemctl mask systemd-repart.service
+	echo "systemd-repart.service is now: $(systemctl is-enabled systemd-repart.service 2>&1)"
+	GUEST
 }
 
 # ---------------------------------------------------------------- strip
@@ -579,18 +571,46 @@ do_verify() {
 			&& ok "systemd-growfs-root.service orders after systemd-repart.service" \
 			|| bad "systemd-growfs-root.service does not order after systemd-repart.service -- the filesystem would grow one boot late"
 	fi
-	# A dry run proves the configuration parses and the disk is understood.
-	# systemd-repart exits 0 on no-change, so this is a clean assertion --
-	# there is no exit-1-means-two-things ambiguity here; that was growpart.
+	# 🔴 THIS COMMENT USED TO SAY "systemd-repart exits 0 on no-change, so this
+	# is a clean assertion -- there is no exit-1-means-two-things ambiguity
+	# here; that was growpart." It is FALSE. Measured 2026-08-03: on a disk with
+	# no free space it exits 1 with "Can't fit requested partitions into
+	# available free space (0B), refusing." The ambiguity was never growpart's
+	# alone, and this check asserted the false half of it.
+	#
+	# What a dry run can still prove is that the CONFIGURATION PARSES and the
+	# disk is understood. So the tolerated outcome is named explicitly, exactly
+	# as the wrapper names it, and anything else is still a failure.
 	echo "  -- systemd-repart --dry-run=yes --"
 	if systemd-repart --dry-run=yes > /tmp/repart.dryrun 2>&1; then
 		sed 's/^/       /' /tmp/repart.dryrun
 		ok "systemd-repart parses the configuration and understands the disk"
+	elif grep -q "Can't fit requested partitions into available free space" /tmp/repart.dryrun; then
+		sed 's/^/       /' /tmp/repart.dryrun
+		ok "systemd-repart parses the configuration; nothing to grow on this disk (the wrapper tolerates exactly this)"
 	else
 		sed 's/^/       /' /tmp/repart.dryrun
-		bad "systemd-repart --dry-run=yes exited non-zero"
+		bad "systemd-repart --dry-run=yes failed for a reason that is NOT 'no free space'"
 	fi
 	rm -f /tmp/repart.dryrun
+
+	# The growth unit contract: ours enabled, systemd's masked, wrapper present.
+	[ -x /usr/local/sbin/switch-growroot ] && ok "/usr/local/sbin/switch-growroot present" \
+		|| bad "/usr/local/sbin/switch-growroot missing (the growth unit has no ExecStart)"
+	[ "$(systemctl is-enabled switch-growroot.service 2>/dev/null)" = enabled ] \
+		&& ok "switch-growroot.service is enabled" || bad "switch-growroot.service is not enabled"
+	[ "$(systemctl is-enabled systemd-repart.service 2>/dev/null)" = masked ] \
+		&& ok "systemd-repart.service is MASKED (it exits 1 on a full disk and would fail every boot)" \
+		|| bad "systemd-repart.service is not masked -- it will run alongside ours and fail"
+	# 🔴 The unit asset's own header calls this shape UNVERIFIED:
+	# Before=local-fs-pre.target plus WantedBy=sysinit.target can produce an
+	# ordering cycle. This assertion is the gate the comment defers to.
+	if journalctl -b --no-pager 2>/dev/null | grep -q 'Found ordering cycle'; then
+		journalctl -b --no-pager 2>/dev/null | grep -A3 'Found ordering cycle' | sed 's/^/       /'
+		bad "the boot journal contains 'Found ordering cycle' -- switch-growroot's ordering is wrong"
+	else
+		ok "no ordering cycle in the boot journal (switch-growroot's edges are safe)"
+	fi
 
 	echo "== identity =="
 	[ -x /usr/local/sbin/switch-firstboot ] && ok "/usr/local/sbin/switch-firstboot present" \
@@ -1316,41 +1336,91 @@ do_selftest() {
 	esac
 
 	# ------------------------------------------------------------------ S2
-	hdr "S2  grow_unit_verdict(): the decision, as a pure predicate over text"
-	printf 'REPART_BINARY=yes\nREPART_MASKED=no\nREPART_WANTEDBY_SYSINIT=yes\nGROWFS_AFTER_REPART=yes\n' \
-		| grow_unit_verdict | grep -qx shipped \
-		&& ok "all four facts healthy -> shipped (no custom unit installed)" \
-		|| bad "healthy facts did not yield 'shipped'"
-	for n in REPART_BINARY=no REPART_MASKED=yes REPART_WANTEDBY_SYSINIT=no GROWFS_AFTER_REPART=no; do
-		{ printf 'REPART_BINARY=yes\nREPART_MASKED=no\nREPART_WANTEDBY_SYSINIT=yes\nGROWFS_AFTER_REPART=yes\n'
-		  printf '%s\n' "$n"; } | grow_unit_verdict | grep -qx custom \
-			&& ok "$n alone -> custom (the shipped unit cannot be relied on)" \
-			|| bad "$n did not force the custom unit"
-	done
-	# A missing or unreadable fact is not evidence for EITHER answer.
-	printf 'REPART_BINARY=yes\nREPART_MASKED=no\n' | grow_unit_verdict >/dev/null 2>&1 \
-		&& bad "a truncated probe produced a verdict -- the stage would guess" \
-		|| ok "a truncated probe produces NO verdict (the caller dies rather than guess)"
-	printf '' | grow_unit_verdict >/dev/null 2>&1 \
-		&& bad "empty probe output produced a verdict" || ok "empty probe output produces no verdict"
-	printf 'REPART_BINARY=maybe\nREPART_MASKED=no\nREPART_WANTEDBY_SYSINIT=yes\nGROWFS_AFTER_REPART=yes\n' \
-		| grow_unit_verdict >/dev/null 2>&1 \
-		&& bad "a fact that is neither yes nor no was accepted" \
-		|| ok "a fact that is neither yes nor no is REFUSED (no silent default)"
-	# The keys are matched anchored: a line that merely CONTAINS the key name
-	# must not be read as the fact.
-	printf 'REPART_BINARY=yes\nREPART_MASKED=no\nREPART_WANTEDBY_SYSINIT=yes\nGROWFS_AFTER_REPART=yes\nXREPART_MASKED=yes\n' \
-		| grow_unit_verdict | grep -qx shipped \
-		&& ok "a key that is only a SUFFIX of a fact name is ignored (^ anchored)" \
-		|| bad "an unanchored key match changed the verdict"
-	# Last assignment wins, so a repeated key cannot be smuggled past by putting
-	# the healthy value first.
-	printf 'REPART_BINARY=yes\nREPART_MASKED=no\nREPART_MASKED=yes\nREPART_WANTEDBY_SYSINIT=yes\nGROWFS_AFTER_REPART=yes\n' \
-		| grow_unit_verdict | grep -qx custom \
-		&& ok "a repeated fact takes its LAST value (a healthy line cannot mask a later unhealthy one)" \
-		|| bad "a repeated fact took its first value"
-	[ "$(printf 'REPART_BINARY=no\nREPART_MASKED=yes\nREPART_WANTEDBY_SYSINIT=no\nGROWFS_AFTER_REPART=no\n' | grow_unit_verdict)" = custom ] \
-		&& ok "all four facts unhealthy -> custom" || bad "all-unhealthy facts did not yield 'custom'"
+	#
+	# 🔴 THIS SECTION REPLACES the grow_unit_verdict() tests. That function chose
+	# between the shipped systemd-repart.service and our custom unit on four
+	# WIRING facts, and it was deleted: the shipped unit's disqualifying property
+	# is its EXIT STATUS on a full disk, which no wiring fact can see. It chose
+	# `shipped` on a real guest and the artifact got a permanently failed unit.
+	#
+	# The decision moved to RUNTIME, so its test moves with it. The wrapper is
+	# still a pure predicate over text -- systemd-repart's message and status in,
+	# a verdict out -- so it is still exercised here in both polarities, with no
+	# VM, no root and no network. SWITCH_REPART exists precisely so this is
+	# testable without filling a real disk.
+	hdr "S2  switch-growroot: tolerate 'nothing to grow', and NOTHING else"
+	local GR="$ASSETS/usr.local.sbin/switch-growroot" FR="$W/fakerepart"
+	mkdir -p "$W/gr"
+	[ -x "$GR" ] || chmod +x "$GR" 2>/dev/null || true
+
+	# $1 = exit status the stand-in returns, $2 = what it prints
+	mk_repart() {
+		printf '#!/bin/sh\nprintf "%%s\\n" %s\nexit %s\n' "$(printf '%q' "$2")" "$1" > "$FR"
+		chmod 0755 "$FR"
+	}
+
+	mk_repart 0 'Growing existing partition 0.'
+	if out="$(SWITCH_REPART="$FR" sh "$GR" 2>&1)"; then
+		ok "systemd-repart exit 0 -> wrapper exit 0 (the grow happened)"
+	else bad "wrapper failed on a SUCCESSFUL repart"; fi
+	case "$out" in *"Growing existing partition"*)
+		ok "and repart's own output is passed through, not swallowed" ;;
+	*) bad "the wrapper hid repart's output" ;; esac
+
+	# 🔴 THE CASE THE EPIC SAID COULD NOT HAPPEN. Verbatim from the guest.
+	mk_repart 1 "Can't fit requested partitions into available free space (0B), refusing."
+	if out="$(SWITCH_REPART="$FR" sh "$GR" 2>&1)"; then
+		ok "exit 1 + 'Can't fit ... available free space' -> wrapper exit 0 (nothing to grow)"
+	else
+		bad "the wrapper FAILED on the no-free-space case -- this is the whole reason it exists"
+	fi
+	case "$out" in *"nothing to grow"*) ok "and it says why, rather than passing silently" ;;
+	*) bad "the tolerated case is silent -- indistinguishable from a real grow" ;; esac
+
+	# Everything else must still fail, or a real growth failure ships silently.
+	mk_repart 1 'Failed to open device /dev/vda: No such file or directory'
+	if SWITCH_REPART="$FR" sh "$GR" >/dev/null 2>&1; then
+		bad "a DIFFERENT exit-1 failure was tolerated -- the wrapper is a blanket ignore"
+	else ok "exit 1 for any other reason still FAILS (not a blanket ignore)"; fi
+
+	mk_repart 2 'Something else went wrong entirely'
+	if SWITCH_REPART="$FR" sh "$GR" >/dev/null 2>&1; then
+		bad "exit 2 was tolerated -- the epic's 'exit 2 is a genuine error' rule is broken"
+	else ok "exit 2 still FAILS loudly (the epic's rule for the identical growpart trap)"; fi
+	out="$(SWITCH_REPART="$FR" sh "$GR" 2>&1 || true)"
+	case "$out" in *"real growth failure"*) ok "and a real failure says AD-4's guarantee does not hold" ;;
+	*) bad "a real growth failure is not explained" ;; esac
+
+	# The status is PROPAGATED, not flattened to 1 -- a caller reading it can
+	# still tell 2 from 1.
+	mk_repart 2 'boom'
+	# 🔴 `cmd; rc=$?` would never reach the assignment: under `set -e` the
+	# failing command aborts the shell first, and this whole section is ABOUT
+	# commands that fail. The && / || form keeps the status reachable.
+	local rc=0
+	SWITCH_REPART="$FR" sh "$GR" >/dev/null 2>&1 || rc=$?
+	[ "$rc" = 2 ] && ok "the original exit status is propagated ($rc), not flattened" \
+	              || bad "exit status was rewritten to $rc"
+
+	# 🔴 The message match must not be so loose that any 'refusing' passes.
+	mk_repart 1 'refusing to proceed for some other reason'
+	if SWITCH_REPART="$FR" sh "$GR" >/dev/null 2>&1; then
+		bad "the tolerance matched on a loose substring -- unrelated refusals pass"
+	else ok "the tolerance matches the FULL message, not just 'refusing'"; fi
+
+	# The unit must actually invoke the wrapper, or none of the above is reached.
+	grep -q '^ExecStart=/usr/local/sbin/switch-growroot$' \
+		"$ASSETS/etc.systemd.system/switch-growroot.service" \
+		&& ok "the unit's ExecStart is the wrapper, not systemd-repart directly" \
+		|| bad "the unit bypasses the wrapper -- the tolerance would never run"
+	# ⚠ Anchored, so the header's EXPLANATION of why SuccessExitStatus is absent
+	# does not read as its presence. The unanchored form failed on first run.
+	grep -qE '^[[:space:]]*SuccessExitStatus' "$ASSETS/etc.systemd.system/switch-growroot.service" \
+		&& bad "the unit carries SuccessExitStatus -- that is a blanket ignore in unit form" \
+		|| ok "the unit carries no SuccessExitStatus (76/77 stay real failures)"
+	grep -q '^ExecStart=-' "$ASSETS/etc.systemd.system/switch-growroot.service" \
+		&& bad "the unit uses a '-' ExecStart prefix, which the epic rejected for growpart" \
+		|| ok "the unit uses no '-' ExecStart prefix"
 
 	# ------------------------------------------------------------------ S3
 	hdr "S3  preflight: what it asks the guest, and what it does with the answer"
@@ -1455,33 +1525,43 @@ do_selftest() {
 	payload_code "$(payload_index 'findmnt -no FSTYPE' || echo 0)" 2>/dev/null | grep -qE '^[[:space:]]*btrfs\)' \
 		&& ok "prepare asserts the root filesystem can carry a plain swapfile (a btrfs case arm that refuses)" \
 		|| bad "the swapfile filesystem precondition is not checked"
-	# GROW_UNIT=auto with healthy facts: the SHIPPED unit, no custom file.
-	pushed_call /etc/systemd/system/switch-growroot.service >/dev/null 2>&1 \
-		&& bad "healthy facts still installed the custom switch-growroot.service" \
-		|| ok "healthy facts -> the shipped systemd-repart.service, no custom unit pushed"
-	printf '%s\n' "$PHASE_OUT" | grep -q 'grow-unit probe verdict: shipped' \
-		&& ok "the verdict is reported to the operator" || bad "the grow-unit verdict is not reported"
-	assert_no_forbidden_traffic prepare
-	# The custom path, forced by facts.
-	guest_up; run_phase prepare SHIM_FACTS="$FACTS_MASKED"
-	[ "$PHASE_RC" = 0 ] && ok "prepare exits 0 when the shipped repart unit is masked" || bad "prepare failed on the masked-unit path"
+	# 🔴 THE GROWTH UNIT IS UNCONDITIONAL NOW. The eight assertions that used to
+	# live here tested GROW_UNIT=auto/shipped/custom and the truncated-probe
+	# refusal -- a decision that has been deleted, because it chose `shipped` on
+	# healthy wiring facts and the artifact got a permanently failed unit. What
+	# replaces them is stricter: the custom unit and its wrapper go in ALWAYS,
+	# and the shipped unit is masked ALWAYS, whatever the probe says.
+	assert_pushed usr.local.sbin/switch-growroot /usr/local/sbin/switch-growroot 0755
 	assert_pushed etc.systemd.system/switch-growroot.service /etc/systemd/system/switch-growroot.service 0644
-	printf '%s\n' "$PHASE_OUT" | grep -q 'UNVERIFIED' \
-		&& ok "the custom growth path is announced as UNVERIFIED" || bad "the custom path is installed without saying it is unverified"
-	# The overrides, and the refusal.
-	guest_up; run_phase prepare GROW_UNIT=custom
-	pushed_call /etc/systemd/system/switch-growroot.service >/dev/null \
-		&& ok "GROW_UNIT=custom installs the custom unit even when the facts are healthy" || bad "GROW_UNIT=custom did not install the custom unit"
-	guest_up; run_phase prepare GROW_UNIT=shipped SHIM_FACTS="$FACTS_MASKED"
-	pushed_call /etc/systemd/system/switch-growroot.service >/dev/null 2>&1 \
-		&& bad "GROW_UNIT=shipped installed the custom unit anyway" \
-		|| ok "GROW_UNIT=shipped suppresses the custom unit even when the facts are unhealthy"
-	guest_up; run_phase prepare GROW_UNIT=sideways
-	[ "$PHASE_RC" != 0 ] && ok "GROW_UNIT=<nonsense> is refused" || bad "GROW_UNIT=sideways was accepted"
-	guest_up; run_phase prepare SHIM_FACTS="$FACTS_TRUNCATED"
-	[ "$PHASE_RC" != 0 ] && ok "a truncated grow probe aborts prepare rather than guessing" || bad "a truncated grow probe did not abort prepare"
-	printf '%s\n' "$PHASE_OUT" | grep -q 'refusing to guess' \
-		&& ok "the abort says it is refusing to guess" || bad "the truncated-probe abort is not explained"
+	# ⚠ These two go to the guest inside a `sudo sh -s` HEREDOC, so they are in
+	# the payload, not in the ledger's argv -- and comments are stripped, because
+	# the payload documents its own reasoning and a whole-text grep would match
+	# the explanation instead of the command.
+	all_payloads | sed 's/#.*//' | grep -q 'systemctl enable switch-growroot.service' \
+		&& ok "switch-growroot.service is enabled" || bad "switch-growroot.service is never enabled"
+	all_payloads | sed 's/#.*//' | grep -q 'systemctl mask systemd-repart.service' \
+		&& ok "the shipped systemd-repart.service is MASKED (disable is a no-op: it is a static unit)" \
+		|| bad "the shipped unit is not masked -- it would run alongside ours and fail on a full disk"
+	printf '%s\n' "$PHASE_OUT" | grep -q 'growth unit: CUSTOM' \
+		&& ok "the growth-unit choice is reported to the operator" || bad "the growth-unit choice is not reported"
+	# The probe still runs, and its facts are still printed -- as diagnostics.
+	printf '%s\n' "$PHASE_OUT" | grep -q 'REPART_BINARY=' \
+		&& ok "the probe facts are still recorded (diagnostics, deciding nothing)" \
+		|| bad "the probe facts are no longer reported at all"
+	assert_no_forbidden_traffic prepare
+	# 🔴 AND THE DECISION DOES NOT MOVE WITH THE FACTS. This is the assertion the
+	# deleted verdict function could never make: unhealthy facts, healthy facts
+	# and a truncated probe must all produce the SAME install.
+	for f in "$FACTS_MASKED" "$FACTS_TRUNCATED"; do
+		guest_up; run_phase prepare SHIM_FACTS="$f"
+		[ "$PHASE_RC" = 0 ] && ok "prepare still exits 0 with a different probe result" \
+		                    || bad "prepare failed on a differing probe result: rc=$PHASE_RC"
+		pushed_call /usr/local/sbin/switch-growroot >/dev/null 2>&1 \
+			&& ok "and the wrapper is installed regardless of what the probe said" \
+			|| bad "the probe result changed whether the wrapper was installed"
+		all_payloads | sed 's/#.*//' | grep -q 'systemctl mask systemd-repart.service' \
+			&& ok "and the shipped unit is masked regardless" || bad "masking depended on the probe"
+	done
 	# 🔴 MUST FAIL: an unmet precondition must stop prepare BEFORE anything is
 	# installed. A stage that pushes five files and then refuses has already
 	# changed the guest.
@@ -1799,17 +1879,24 @@ do_selftest() {
 	forbid_in "$SS" 'grep'"[^|]*/proc/swaps" \
 		"the switch-swapfile script greps /proc/swaps (it is TAB-delimited, so a space-anchored pattern never matches -- this project has already shipped that bug)"
 
-	# switch-growroot.service -- the fallback, and its flagged divergence.
+	# switch-growroot.service -- no longer a fallback: it is THE growth unit.
 	grep -qx '\[Install\]' "$GU" \
 		&& ok "switch-growroot.service has an [Install] section -- systemctl enable cannot enable a unit without one" \
-		|| bad "switch-growroot.service has no [Install] section: 'systemctl enable' would fail and the fallback would never run"
+		|| bad "switch-growroot.service has no [Install] section: 'systemctl enable' would fail and growth would never run"
 	grep -qx 'WantedBy=sysinit.target' "$GU" && ok "switch-growroot.service is WantedBy=sysinit.target" || bad "switch-growroot.service is not wanted by sysinit.target"
-	grep -q 'deliberate divergence\|divergences' "$GU" \
-		&& ok "the added [Install] section is FLAGGED in the file as a divergence from the recorded configuration" \
-		|| bad "the divergence from the recorded configuration is not flagged"
-	forbid_in "$GU" 'SuccessExitStatus' \
+	grep -q 'UNVERIFIED UNTIL BOOTED' "$GU" \
+		&& ok "the ordering-cycle risk is FLAGGED in the file, and verify is named as the gate" \
+		|| bad "the ordering-cycle risk is not flagged in the unit"
+	# ⚠ COMMENTS STRIPPED. The file's header EXPLAINS why SuccessExitStatus is
+	# not copied, so a whole-file grep matches the explanation and reports the
+	# opposite of the truth. That is the same defect as the `grep -q NOPASSWD`
+	# that passed on a file demanding a password -- and it fired here, on the
+	# first run of this very assertion.
+	forbid_in "$GU" '^[[:space:]]*SuccessExitStatus' \
 		"switch-growroot.service copies SuccessExitStatus=76/77 (on this artifact 'no root block device' and 'no GPT' are genuine failures worth surfacing)"
-	grep -q 'ExecStart=/usr/bin/systemd-repart --dry-run=no' "$GU" && ok "switch-growroot.service actually performs the repart (--dry-run=no)" || bad "switch-growroot.service ExecStart is wrong"
+	grep -qx 'ExecStart=/usr/local/sbin/switch-growroot' "$GU" \
+		&& ok "switch-growroot.service runs the WRAPPER, which tolerates 'nothing to grow' and nothing else" \
+		|| bad "switch-growroot.service ExecStart is wrong -- it must be the wrapper, not systemd-repart directly"
 	grep -qx 'ConditionPathExists=/etc/repart.d' "$GU" && ok "switch-growroot.service is conditioned on /etc/repart.d existing" || bad "switch-growroot.service has no condition"
 
 	# ------------------------------------------------------------------ S11
