@@ -216,7 +216,23 @@ GRUB_TIMEOUT_STYLE=menu
 DROPIN
 }
 
-repo_dropin() { [ -n "$HERE" ] && printf '%s/../assets/etc.default.grub.d/%s' "$HERE" "$DROPIN_NAME"; }
+# 🔴 TOTAL BY CONSTRUCTION: returns 0 and prints nothing when there is no repo.
+# It previously ended at `[ -n "$HERE" ] && printf ...`, which RETURNS 1 when
+# HERE is empty -- and HERE is empty in exactly one situation: this script piped
+# over ssh as `bash -s`, which is the only way it ever reaches a guest. Under
+# `set -e` the unguarded `r="$(repo_dropin)"` in dropin_source() then aborted
+# the whole install with no message and rc=1, immediately after printing the
+# note saying it would use the embedded copy. So `install` had never once
+# worked on the path it is documented for, and said nothing.
+#
+# The header comment above HERE already describes this case correctly; the
+# intent was right and the mechanism silently did the opposite. check_dropin_drift
+# survived only because its one call site is `|| true`, which disables set -e
+# for that call and hid the defect from the very function meant to report it.
+repo_dropin() {
+	[ -n "$HERE" ] || return 0
+	printf '%s/../assets/etc.default.grub.d/%s' "$HERE" "$DROPIN_NAME"
+}
 
 # The installed bytes: the repo asset when visible, the embedded copy otherwise.
 dropin_source() {
@@ -1006,6 +1022,29 @@ do_selftest() {
 	[ -x "$FR$HOOK_PATH" ]                              && ok "installed $HOOK_PATH executable"              || bad "kernel hook missing"
 	[ "$(grep -m1 '^KERNEL=' "$FR$STATE_FILE" 2>/dev/null | cut -d= -f2-)" = "$k" ] \
 		&& ok "seeded $STATE_FILE with the shipped kernel $k"  || bad "last-known-good not seeded"
+
+	# 🔴 S5b -- THE PIPED PATH, which is the ONLY way this stage reaches a guest.
+	# In-guest it runs as `ssh 'sudo bash -s install' < this-file`, where
+	# BASH_SOURCE is not a readable path and HERE is therefore empty. Every
+	# assertion above runs IN-PROCESS with HERE set, so not one of them covered
+	# the guest path -- and it was broken from the day it was written: repo_dropin
+	# returned 1, set -e aborted the install with no message, and the run exited
+	# rc=1 having installed nothing. Found by running it against a real guest.
+	local PR="$W/piped-root"
+	mkdir -p "$PR/etc/default/grub.d" "$PR/lib/modules/$k/updates/dkms"
+	: > "$PR/lib/modules/$k/updates/dkms/mlxsw_spectrum.ko.xz"
+	if bash -s install --root "$PR" < "${BASH_SOURCE[0]}" >"$W/piped.log" 2>&1; then
+		ok "install works PIPED with no repo on disk (the documented in-guest path)"
+	else
+		bad "install FAILS when piped over ssh -- the only way this stage reaches a guest"
+		sed 's/^/       /' "$W/piped.log"
+	fi
+	[ -s "$PR$DROPIN_DIR/$DROPIN_NAME" ] \
+		&& ok "and the piped path really writes the boot-policy drop-in" \
+		|| bad "the piped path installed no drop-in"
+	[ -x "$PR$HELPER_PATH" ] \
+		&& ok "and the piped path really installs the recovery helper" \
+		|| bad "the piped path installed no helper"
 	# The disjointness invariant, checked as a plain grep: none of the sibling's
 	# three variable NAMES may appear in this file at all, not even in a
 	# comment, so the check cannot be fooled by prose. The serial-port command
