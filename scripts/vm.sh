@@ -523,6 +523,418 @@ do_destroy() {
 	info "working image removed; pristine base kept in $CACHE"
 }
 
+# ---------------------------------------------------------------- selftest
+#
+# OFFLINE proof: no VM, no root, no network. This script is a host-side driver
+# whose work happens in qemu and in a guest, so its offline tier is shim-ledger
+# based -- re-enter THIS script as a child with stand-ins first on PATH, record
+# what it tried to do, and assert on the record.
+#
+# 🔴 PROOF BY OUTCOME WHEREVER AN OUTCOME EXISTS. The do_down ladder is not
+# proven by reading its source: a REAL throwaway process stands in for the
+# guest, the real do_down runs against it, and the assertions are about what
+# happened to that process. Rung 3 genuinely kills it.
+#
+# 🔴 WHAT THIS TIER CANNOT PROVE -- named so it is not mistaken for covered.
+# The QMP wire handshake itself. Speaking QMP needs something LISTENING on a
+# TCP port; bash's /dev/tcp is a client only, and it is a SHELL BUILTIN, so no
+# PATH shim can intercept it. socat, nc and python3 would each break the
+# qemu+xorriso+curl dependency floor, and launching a real qemu to listen would
+# contradict this tier's own "no VM" claim. So what is proven here is rung 2's
+# FAILURE path, its POSITION in the ladder, and the exact bytes it would send.
+# Rung 2's SUCCESS path is covered by the live ladder tests recorded on the
+# out-of-band-guest-access task, and by nothing in here.
+t_pass=0
+t_fail=0
+ok()  { printf '  \033[32mPASS\033[0m %s\n' "$*"; t_pass=$((t_pass + 1)); }
+bad() { printf '  \033[31mFAIL\033[0m %s\n' "$*"; t_fail=$((t_fail + 1)); }
+inf() { printf '  \033[36mNOTE\033[0m %s\n' "$*"; }
+hdr() { printf '\n\033[1m%s\033[0m\n' "$*"; }
+
+# Forbidden-idiom grep over a file, COMMENTS EXEMPT so this file may document
+# what it refuses to do. Every pattern is assembled from adjacent quoted
+# fragments so the literal never appears contiguously here and the guard cannot
+# match its own definition -- the same bug class as `pkill -f` matching its own
+# invoking shell.
+forbid_in() { # $1 = file, $2 = ERE, $3 = description
+	local hits
+	hits="$(sed 's/#.*//' "$1" | grep -nE "$2" || true)"
+	if [ -z "$hits" ]; then ok "never $3"
+	else bad "$3 -- found:"; printf '%s\n' "$hits" | sed 's/^/       /'; fi
+}
+
+SELFTEST_TMP=""
+SELFTEST_PID=""
+# 🔴 EVERY BRANCH IS AN `if`, NEVER `[ ... ] && { ... }`. Under `set -e` a
+# false test at statement level returns 1 and aborts the function -- the first
+# draft ended with `[ -n "$SELFTEST_PID" ] && { kill ...; }` and, whenever that
+# test was false, never reached the `rm -rf` below. It leaked a temp tree per
+# run while reporting a clean exit: a cleanup path that silently never ran,
+# which is the same class as the checks this harness exists to catch.
+selftest_cleanup() {
+	local p
+	if [ -z "${SELFTEST_TMP:-}" ]; then return 0; fi
+	# Everything this harness started: the guests it spawned directly, and the
+	# ones the qemu stand-in spawned on its behalf.
+	if [ -r "$SELFTEST_TMP/spawned" ]; then
+		while read -r p; do kill "$p" 2>/dev/null || true; done < "$SELFTEST_TMP/spawned"
+	fi
+	if [ -n "${SELFTEST_PID:-}" ]; then kill "$SELFTEST_PID" 2>/dev/null || true; fi
+	rm -rf "$SELFTEST_TMP"
+	SELFTEST_TMP=""
+	return 0
+}
+
+write_selftest_shims() { # $1 = bin dir
+	local d="$1" g
+	mkdir -p "$d"
+	cat > "$d/.recorder" <<-'SHIM'
+	#!/bin/sh
+	# Recorded stand-in: logs its argv and stdin, then simulates the MINIMUM
+	# each caller parses. Nothing else is faked -- anything not answered here
+	# is a real coreutils binary doing real work on real files.
+	d="${SHIM_DIR:?SHIM_DIR unset -- a shim escaped its harness}"
+	n=$(cat "$d/seq" 2>/dev/null || echo 0)
+	n=$((n + 1)); printf '%s\n' "$n" > "$d/seq"
+	prog=${0##*/}
+	printf '%s %s\n' "$prog" "$*" >> "$d/ledger"
+	: > "$d/argv.$n"
+	for a in "$@"; do printf '%s\n' "$a" >> "$d/argv.$n"; done
+	: > "$d/stdin.$n"
+	[ -t 0 ] || cat >> "$d/stdin.$n"
+
+	# Pull the value following a flag out of argv, POSIX-ly.
+	argval() { f=$1; shift; nx=0; for a in "$@"; do
+		[ "$nx" = 1 ] && { printf '%s\n' "$a"; return 0; }
+		[ "$a" = "$f" ] && nx=1; done; return 1; }
+
+	case "$prog" in
+	ssh)
+		# A dead sshd is the case the ladder exists for, so it is a first-class
+		# mode rather than something the harness works around.
+		[ "${SHIM_SSH_RC:-0}" = 0 ] || exit "${SHIM_SSH_RC}"
+		for a in "$@"; do
+			case "$a" in
+			*"systemctl poweroff"*)
+				# REALLY end the stand-in guest. wait_down then observes a
+				# genuine transition instead of a rewritten pidfile.
+				if [ -r "${SHIM_GUEST_PIDFILE:-/nonexistent}" ]; then
+					kill "$(cat "$SHIM_GUEST_PIDFILE")" 2>/dev/null || true
+				fi ;;
+			esac
+		done ;;
+	qemu-system-x86_64)
+		# Stand in for a booted guest by leaving a REAL live process behind the
+		# pidfile: vm_running then answers honestly for the rest of the run.
+		pf=$(argval -pidfile "$@") || pf=
+		if [ -n "$pf" ]; then
+			# 🔴 EVERY fd redirected away from the caller's. run_cmd captures
+			# this run with $(...), and a command substitution reads until the
+			# LAST writer closes the pipe -- a background process inheriting
+			# stdout holds it open for its full lifetime. The first draft
+			# backgrounded a 900s sleep and hung the harness for 900s, looking
+			# exactly like a deadlock in the code under test.
+			sleep 900 </dev/null >/dev/null 2>&1 &
+			printf '%s\n' "$!" > "$pf"
+			printf '%s\n' "$!" >> "${SHIM_SPAWNED:-/dev/null}"
+		fi ;;
+	qemu-img)
+		# do_up parses the PLAIN output deliberately (the JSON nests the
+		# backing file's size first). Answer in exactly that shape.
+		[ "${1:-}" = info ] && printf 'virtual size: 3 GiB (3221225472 bytes)\n' ;;
+	ssh-keygen)
+		f=$(argval -f "$@") || f=
+		if [ -n "$f" ]; then
+			printf 'FAKE-PRIVATE-KEY\n' > "$f"; chmod 0600 "$f"
+			printf 'ssh-ed25519 AAAAFAKE mlnx-sw-os build\n' > "$f.pub"
+		fi ;;
+	xorrisofs)
+		o=$(argval -output "$@") || o=
+		[ -n "$o" ] && printf 'FAKE-ISO\n' > "$o" ;;
+	curl)
+		o=$(argval -o "$@") || o=
+		case "$o" in
+		"")          ;;
+		*SUMS|*SHA*) printf '%s  %s\n' "${SHIM_SUM:-000bad000}" "${SHIM_SUM_NAME:-debian-13-generic-amd64.qcow2}" > "$o" ;;
+		*)           printf 'FAKE-BASE-IMAGE\n' > "$o" ;;
+		esac ;;
+	esac
+	exit 0
+	SHIM
+	chmod 0755 "$d/.recorder"
+	for g in ssh qemu"-system"-x86_64 qemu-img ssh-keygen xorrisofs curl; do
+		cp "$d/.recorder" "$d/$g"
+	done
+}
+
+do_selftest() {
+	# 🔴 EVERY ONE OF THESE IS A `local`, NEVER A FILE-SCOPE ASSIGNMENT.
+	# run_cmd re-enters this script, so a file-scope assignment runs AGAIN in
+	# the child -- and because these names arrive in the child's environment
+	# already marked exported, re-assigning one there changes what the SHIMS
+	# see. A file-scope SHIM_DIR="" is documented on stage-generalize.sh:907
+	# as having produced an empty ledger and a harness that asserted nothing.
+	local T SELF_PATH SHIM_BIN SHIM_DIR FAKE_WORK CMD_OUT CMD_RC real_sum
+	SELF_PATH="${BASH_SOURCE[0]}"
+	T="$(mktemp -d)"; SELFTEST_TMP="$T"
+	trap selftest_cleanup EXIT INT TERM
+	SHIM_BIN="$T/bin"; SHIM_DIR="$T/shim"; FAKE_WORK="$T/work"
+	mkdir -p "$SHIM_DIR" "$FAKE_WORK/cache"
+	: > "$T/spawned"
+	write_selftest_shims "$SHIM_BIN"
+
+	# --- harness -----------------------------------------------------------
+	run_cmd() { # $1 = subcommand, $2.. = VAR=VALUE
+		local sub="$1"; shift
+		rm -rf "$SHIM_DIR"; mkdir -p "$SHIM_DIR"
+		printf '0\n' > "$SHIM_DIR/seq"; : > "$SHIM_DIR/ledger"
+		CMD_RC=0
+		# </dev/null matters: a stand-in reading stdin with nothing redirected
+		# in would block on the caller's terminal forever.
+		CMD_OUT="$(env PATH="$SHIM_BIN:$PATH" SHIM_DIR="$SHIM_DIR" \
+			SHIM_SPAWNED="$T/spawned" SHIM_GUEST_PIDFILE="$FAKE_WORK/qemu.pid" \
+			WORK="$FAKE_WORK" DISTRO=debian "$@" \
+			bash "$SELF_PATH" "$sub" </dev/null 2>&1)" || CMD_RC=$?
+	}
+	calls()      { grep -c . "$SHIM_DIR/ledger" 2>/dev/null || true; }
+	prog_calls() { grep -c "^$1 " "$SHIM_DIR/ledger" 2>/dev/null || true; }
+	said()       { printf '%s\n' "$CMD_OUT" | grep -qF -- "$1"; }
+	line_of()    { printf '%s\n' "$CMD_OUT" | grep -nF -- "$1" | head -1 | cut -d: -f1; }
+
+	# A stand-in guest that is a REAL process, so vm_running/wait_down/kill are
+	# all exercised for real rather than simulated.
+	guest_spawn() {
+		sleep 900 &
+		SELFTEST_PID=$!
+		printf '%s\n' "$SELFTEST_PID" >> "$T/spawned"
+		printf '%s\n' "$SELFTEST_PID" > "$FAKE_WORK/qemu.pid"
+	}
+	guest_alive() { [ -n "${SELFTEST_PID:-}" ] && kill -0 "$SELFTEST_PID" 2>/dev/null; }
+	guest_stop()  {
+		[ -n "${SELFTEST_PID:-}" ] && { kill "$SELFTEST_PID" 2>/dev/null || true; }
+		SELFTEST_PID=""; rm -f "$FAKE_WORK/qemu.pid"
+	}
+
+	# 🔴 Prove the GUARD, not just the code. A forbidden-idiom pattern that
+	# cannot match the thing it forbids is a check that silently never runs --
+	# forbid() once shipped 11 patterns whose reporting branch had never
+	# executed. Bait is matched as TEXT; nothing here is ever executed.
+	guard_fires() { # $1 = ERE, $2 = bait, $3 = description
+		printf '%s\n' "$2" > "$T/bait"
+		grep -qE "$1" "$T/bait" \
+			&& ok "the $3 guard matches its own bait, so it can actually fire" \
+			|| bad "the $3 guard does NOT match what it forbids -- it can never fire"
+	}
+
+	hdr "0  the harness itself is not vacuous"
+	# 🔴 Probe with a run that MUST reach a stand-in. The first draft probed
+	# `status` against a stopped guest, which correctly touches nothing -- so
+	# the vacuity guard reported an empty ledger and was itself the only thing
+	# failing. A guard that cannot distinguish "nothing happened" from "nothing
+	# was supposed to happen" is not a guard.
+	guest_spawn
+	run_cmd status
+	if [ "$(calls)" -gt 0 ]; then
+		ok "a run reaches the stand-ins ($(calls) call(s)) -- ledger assertions are about real traffic"
+	else
+		bad "NO stand-in was ever called: every ledger assertion below would be vacuously true"
+	fi
+	[ -x "$SHIM_BIN/ssh" ] && ok "the stand-ins are on PATH ahead of the real binaries" \
+	                       || bad "the stand-in directory was never populated"
+
+	hdr "1  source guards -- forbidden idioms, and the guards are themselves checked"
+	forbid_in "$SELF_PATH" 'pg''rep[[:space:]]+-[a-zA-Z]*f' \
+		"uses pg""rep -f (it matches the invoking shell's own command line)"
+	forbid_in "$SELF_PATH" 'pk''ill[[:space:]]+-[a-zA-Z]*f' \
+		"uses pk""ill -f (it destroyed the build VM on 2026-08-03)"
+	# The signature bug class: `exec` with ONLY redirections applies them to the
+	# SHELL, permanently. A bare `exec 3<>... 2>/dev/null` silences this script's
+	# stderr for the rest of the run, including rung 3's power-cut warning.
+	forbid_in "$SELF_PATH" '^[[:space:]]*ex''ec[[:space:]]+[0-9]+<>[^;]*2>' \
+		"attaches a redirection to a bare ex""ec on the /dev/tcp open (it would silence the shell permanently)"
+	# 🔴 THE BAIT IS SPLIT TOO, not just the pattern. The first draft split only
+	# the patterns and wrote the bait literally -- so the guards above found the
+	# forbidden idioms inside their own test data and reported this file as
+	# violating rules it does not violate. Bait is data: it is matched as text
+	# and never executed.
+	guard_fires 'pg''rep[[:space:]]+-[a-zA-Z]*f' 'pg''rep -f qemu-system' "pg""rep -f"
+	guard_fires 'pk''ill[[:space:]]+-[a-zA-Z]*f' 'pk''ill -f qemu-system' "pk""ill -f"
+	guard_fires '^[[:space:]]*ex''ec[[:space:]]+[0-9]+<>[^;]*2>' \
+		'	ex''ec 3<>"/dev/tcp/127.0.0.1/$MON_PORT" 2>/dev/null || return 1' "bare-ex""ec redirection"
+	grep -q '{ ex''ec 3<>' "$SELF_PATH" \
+		&& ok "the /dev/tcp open is scoped to a brace group" \
+		|| bad "the /dev/tcp open is not brace-scoped"
+
+	hdr "2  the concurrency property -- MON_PORT is DERIVED, never independently defaulted"
+	grep -q 'MON_PORT="${MON_PORT:-\$((SSH_PORT + 1000))}"' "$SELF_PATH" \
+		&& ok "MON_PORT derives from SSH_PORT" \
+		|| bad "MON_PORT does not derive from SSH_PORT -- two agents on the defaults share one control channel"
+	# do_status reports the monitor only for a RUNNING guest, so these need one:
+	# against a stopped guest the assertions would be measuring silence.
+	guest_spawn
+	run_cmd status SSH_PORT=2500
+	said "3500" && ok "SSH_PORT=2500 yields monitor port 3500 (derived at runtime, not just in source)" \
+	             || bad "the derived monitor port did not follow SSH_PORT"
+	run_cmd status SSH_PORT=2500 MON_PORT=9999
+	said "9999" && ok "an explicit MON_PORT still overrides the derivation" \
+	             || bad "MON_PORT cannot be overridden"
+
+	hdr "3  up -- the qemu invocation, and the pristine base is never mutated"
+	# Clear the stand-in the port checks needed, or up would short-circuit on it
+	# and this section would assert against a qemu that was never launched.
+	guest_stop
+	printf 'PRISTINE-BASE\n' > "$FAKE_WORK/cache/debian-13-generic-amd64.qcow2"
+	real_sum="$(sha512sum "$FAKE_WORK/cache/debian-13-generic-amd64.qcow2" | cut -d' ' -f1)"
+	run_cmd up
+	# Keep THIS run's ledger: run_cmd clears it, and the seed assertions two
+	# sections down are about the boot-from-scratch run, not about whatever ran
+	# last. The first draft asserted the cidata label against the ledger of the
+	# short-circuited second `up`, which launches nothing -- a live assertion
+	# reading a ledger that could never contain what it was looking for.
+	cp "$SHIM_DIR/ledger" "$T/ledger.up"
+	[ "$CMD_RC" = 0 ] && ok "up succeeds against the stand-ins" || bad "up failed: rc=$CMD_RC"
+	grep -q -- '-qmp tcp:127.0.0.1:3222,server=on,wait=off' "$SHIM_DIR/ledger" \
+		&& ok "qemu is given a QMP socket on the derived port" \
+		|| bad "qemu was not given a QMP socket"
+	grep -q -- '-qmp tcp:0.0.0.0' "$SHIM_DIR/ledger" \
+		&& bad "the QMP socket is bound to 0.0.0.0 -- it is a full control channel over the guest" \
+		|| ok "the QMP socket is bound to loopback only, never 0.0.0.0"
+	grep -q -- 'hostfwd=tcp:127.0.0.1:2222-:22' "$SHIM_DIR/ledger" \
+		&& ok "the ssh forward is scoped to loopback" || bad "the ssh forward is not loopback-scoped"
+	grep -q -- '-pidfile' "$SHIM_DIR/ledger" \
+		&& ok "qemu is given a pidfile (liveness is read from it, never from a process name)" \
+		|| bad "qemu is given no pidfile"
+	[ "$(sha512sum "$FAKE_WORK/cache/debian-13-generic-amd64.qcow2" | cut -d' ' -f1)" = "$real_sum" ] \
+		&& ok "the pristine base is byte-identical after up (copied, never mutated)" \
+		|| bad "up MUTATED the pristine base -- a re-run no longer starts from a known state"
+	[ -f "$FAKE_WORK/work.qcow2" ] && ok "the working image is a separate file" \
+	                               || bad "no working image was produced"
+
+	hdr "4  up short-circuits on a running guest (the stale-guest trap)"
+	run_cmd up
+	said "already running" && ok "a second up reports the guest it is handing back" \
+	                       || bad "up did not announce that it short-circuited"
+	[ "$(prog_calls qemu-system-x86_64)" = 0 ] \
+		&& ok "and it started no second qemu" || bad "up started a second qemu over a running guest"
+	inf "this is the documented trap: up HANDS BACK whatever is running, so a stale guest"
+	inf "is returned silently unless the caller checks status first"
+
+	hdr "5  the seed -- key-only, no password, anywhere"
+	grep -q 'NOPASSWD:ALL' "$FAKE_WORK/seed/user-data" \
+		&& ok "the build user gets passwordless sudo" || bad "the build user has no sudo rule"
+	grep -q 'ssh_pwauth: false' "$FAKE_WORK/seed/user-data" \
+		&& ok "password authentication is disabled" || bad "password authentication is not disabled"
+	grep -q 'lock_passwd: true' "$FAKE_WORK/seed/user-data" \
+		&& ok "the build user's password is locked" || bad "the build user's password is not locked"
+	grep -qE '^\s+- ssh-ed25519 ' "$FAKE_WORK/seed/user-data" \
+		&& ok "an ssh public key is installed" || bad "no ssh key reached the seed"
+	forbid_in "$FAKE_WORK/seed/user-data" '(pass''word|plain_text_passwd|chpasswd|hashed_passwd)' \
+		"bakes a pass""word into the seed"
+	grep -q -- '-volid cidata' "$T/ledger.up" \
+		&& ok "the seed is built with the cidata volume label cloud-init looks for" \
+		|| bad "the seed carries no cidata label -- cloud-init would never read it"
+
+	hdr "6  do_down RUNG 1 -- ssh, on a reachable guest"
+	guest_spawn
+	run_cmd down
+	said "poweroff over ssh" && ok "rung 1 is attempted first" || bad "rung 1 was not attempted"
+	said "down"              && ok "the guest is reported down" || bad "no down report"
+	said "FORCING"           && bad "rung 3 fired on a guest that ssh could reach" \
+	                         || ok "no force-kill on a reachable guest"
+	guest_alive && bad "the stand-in guest is STILL ALIVE -- rung 1 reported a shutdown that did not happen" \
+	            || ok "the stand-in guest is really gone (outcome, not a message)"
+
+	hdr "7  do_down RUNG 1 PRE-PROBE -- a dead sshd costs no timeout"
+	guest_spawn
+	run_cmd down SHIM_SSH_RC=255 ACPI_TIMEOUT=2
+	said "ssh is not answering" \
+		&& ok "an unreachable guest is detected before rung 1 fires" \
+		|| bad "rung 1 fired blind at an unreachable guest"
+	grep -q 'systemctl poweroff' "$SHIM_DIR/ledger" \
+		&& bad "a poweroff was sent to a guest already known unreachable -- that is the 60s wait, back" \
+		|| ok "no poweroff is sent once ssh is known dead (the 64s -> 2s fix, as an outcome)"
+	[ "$(prog_calls ssh)" -ge 1 ] \
+		&& ok "ssh WAS probed ($(prog_calls ssh) call) -- the skip is measured, not assumed" \
+		|| bad "ssh was never probed at all, so nothing established it was dead"
+
+	hdr "8  do_down RUNG 2 -- unreachable QMP falls through, it does not hang"
+	said "pressing the ACPI power button over QMP" \
+		&& ok "rung 2 is attempted after rung 1 is ruled out" || bad "rung 2 was never attempted"
+	said "QMP not answering" \
+		&& ok "an unreachable monitor is reported rather than silently skipped" \
+		|| bad "rung 2's failure is silent"
+
+	hdr "9  do_down RUNG 3 -- it kills, and it SAYS it was a power cut"
+	said "FORCING" && ok "rung 3 is reached when both other rungs are unavailable" \
+	               || bad "rung 3 never fired, so the guest was left running"
+	said "POWER CUT" && ok "the force rung announces that this is a power cut" \
+	                 || bad "the force rung is SILENT -- this is what let a killed guest read as clean"
+	said "dirty"     && ok "and it says the filesystem is dirty" \
+	                 || bad "the force rung does not warn that the image is not defensible"
+	guest_alive && bad "rung 3 did not actually kill the stand-in guest" \
+	            || ok "the stand-in guest was really killed (outcome, not a message)"
+
+	hdr "10 the ladder's ORDER is what makes it a ladder"
+	local l1 l2 l3
+	l1="$(line_of 'ssh is not answering')"; l2="$(line_of 'ACPI power button')"; l3="$(line_of 'FORCING')"
+	if [ -n "$l1" ] && [ -n "$l2" ] && [ -n "$l3" ] && [ "$l1" -lt "$l2" ] && [ "$l2" -lt "$l3" ]; then
+		ok "ssh -> QMP -> force, in that order (lines $l1 < $l2 < $l3)"
+	else
+		bad "the rungs did not run in order (ssh=$l1 qmp=$l2 force=$l3)"
+	fi
+
+	hdr "11 down on a guest that is not running does nothing at all"
+	rm -f "$FAKE_WORK/qemu.pid"
+	run_cmd down
+	said "not running" && ok "a stopped guest is reported, not acted on" || bad "no 'not running' report"
+	[ "$(prog_calls ssh)" = 0 ] && ok "and nothing is sent to it" || bad "a stopped guest was still contacted"
+
+	hdr "12 status reports the out-of-band channel SEPARATELY from ssh"
+	guest_spawn
+	run_cmd status
+	said "ssh:" && ok "status reports ssh reachability" || bad "status does not report ssh"
+	said "qmp:" && ok "status reports QMP reachability -- after finish it is the only channel left" \
+	            || bad "status does not report the out-of-band channel"
+	said "qmp:     NOT reachable" \
+		&& ok "and it correctly reports an absent monitor rather than assuming one" \
+		|| bad "status claimed a monitor that is not there"
+
+	hdr "13 fetch verifies the checksum -- and REJECTS a bad one"
+	rm -rf "$FAKE_WORK/cache"
+	run_cmd fetch
+	[ "$CMD_RC" != 0 ] && ok "a checksum mismatch aborts the fetch (rc=$CMD_RC)" \
+	                   || bad "fetch ACCEPTED an image whose checksum did not match"
+	said "CHECKSUM MISMATCH" && ok "and it says so" || bad "the mismatch is not reported"
+	rm -rf "$FAKE_WORK/cache"
+	run_cmd fetch SHIM_SUM="$(printf 'FAKE-BASE-IMAGE\n' | sha512sum | cut -d' ' -f1)"
+	[ "$CMD_RC" = 0 ] && ok "a matching checksum is accepted (both polarities -- a verifier that never passes is also broken)" \
+	                  || bad "fetch rejected an image whose checksum DID match: rc=$CMD_RC"
+
+	hdr "14 destroy keeps the pristine base"
+	run_cmd destroy
+	[ -r "$FAKE_WORK/cache/debian-13-generic-amd64.qcow2" ] \
+		&& ok "destroy keeps \$CACHE (the base is expensive and is never mutated)" \
+		|| bad "destroy deleted the pristine base"
+	[ -f "$FAKE_WORK/work.qcow2" ] && bad "destroy left the working image behind" \
+	                               || ok "destroy removes the working image"
+
+	hdr "15 the distro seam refuses what it does not know"
+	run_cmd up DISTRO=freebsd
+	[ "$CMD_RC" != 0 ] && ok "an unknown DISTRO exits non-zero (rc=$CMD_RC)" \
+	                   || bad "an unknown DISTRO was accepted"
+	said "unknown DISTRO" && ok "and names the offending value" || bad "the refusal does not say why"
+
+	hdr "coverage this tier does NOT claim"
+	inf "rung 2's SUCCESS path -- the QMP handshake itself -- is not exercised here."
+	inf "/dev/tcp is a bash BUILTIN, so no PATH stand-in can intercept it, and a real"
+	inf "listener would need socat/nc/python3 or a real qemu. Covered instead by the"
+	inf "live ladder tests recorded on the out-of-band-guest-access task."
+
+	printf '\n----------------------------------------\n'
+	printf '%d passed, %d failed\n' "$t_pass" "$t_fail"
+	[ "$t_fail" -eq 0 ]
+}
+
 # ---------------------------------------------------------------- dispatch
 mkdir -p "$WORK"
 case "${1:-}" in
@@ -535,8 +947,9 @@ audit)     do_audit ;;
 status)    do_status ;;
 down)      do_down ;;
 destroy)   do_destroy ;;
+selftest)  do_selftest ;;
 *)
 	sed -n '2,18p' "$0" | sed 's/^# \?//'
-	printf '\nUsage: %s {fetch|up|ssh|provision|probe|audit|status|down|destroy}\n' "$0"
+	printf '\nUsage: %s {fetch|up|ssh|provision|probe|audit|status|down|destroy|selftest}\n' "$0"
 	exit 1 ;;
 esac
