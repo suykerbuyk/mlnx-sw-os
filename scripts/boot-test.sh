@@ -106,6 +106,16 @@ OVMF_VARS="${OVMF_VARS:-/usr/share/edk2/x64/OVMF_VARS.4m.fd}"
 DMI_VENDOR="${DMI_VENDOR:-Mellanox}"
 DMI_PRODUCT="${DMI_PRODUCT:-MSN2410-BB2FC}"
 DMI_SERIAL="${DMI_SERIAL:-BT0001TEST}"
+# 🔴 THE BOARD-SERIAL RUNG, exercised for real by the fifth run. switch-firstboot
+# falls back from DMI product_serial to DMI board_serial before it falls back to
+# machine-id, because a machine whose PRODUCT serial is a placeholder can still
+# have a valid BASEBOARD serial -- observed on Arch hardware. qemu can drive both
+# fields (-smbios type=1,serial= and type=2,serial=), so the rung is testable
+# end to end instead of being a code path nothing ever takes.
+DMI_BOARD_SERIAL="${DMI_BOARD_SERIAL:-MB0002TEST}"
+# What a machine with no system serial actually reports. usable_serial() rejects
+# it by pattern, which is what makes the board_serial rung reachable.
+DMI_SERIAL_PLACEHOLDER="${DMI_SERIAL_PLACEHOLDER:-Not Specified}"
 
 INSPECT_KEY="$WORK/inspect_key"         # throwaway, inspector VM only
 
@@ -141,6 +151,24 @@ assert() { # $1 = 0/1 rc, $2 = description
 # so a BIOS run cannot read a UEFI run's serial log and conclude anything.
 
 RUN_TAG=""; RUN_DIR=""; RUN_PIDFILE=""; RUN_SERIAL=""; RUN_SSH=0; RUN_MON=0
+# The hostname THIS run must produce, computed from the SMBIOS it was given.
+# Per-run rather than global because the board-serial run is given different
+# DMI and must therefore expect a different name -- a single global here would
+# make that run assert the other runs' expectation and pass without meaning it.
+RUN_WANT_HOST=""
+
+# 🔴 MIRRORS switch-firstboot's derivation, including the inner printf. Without
+# it, `sanitize | tail -c 8` counts sed's trailing NEWLINE as one of the eight
+# bytes and yields SEVEN characters -- the harness and the script agreed on the
+# wrong answer, so the assertion passed while both were off by one against the
+# documented "last 8". Fixed in both places on 2026-08-04; they must move
+# together or this check silently stops discriminating.
+sanitize_dmi() { printf '%s' "${1:-}" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9-' '-' \
+	| sed -e 's/--*/-/g' -e 's/^-//' -e 's/-$//'; }
+want_hostname() { # $1 = DMI product, $2 = the serial the script will settle on
+	printf 'mlnx-%s-%s' "$(sanitize_dmi "$1")" \
+		"$(printf '%s' "$(sanitize_dmi "$2")" | tail -c 8)"
+}
 
 run_scope() { # $1 = tag, $2 = port index
 	RUN_TAG="$1"
@@ -445,9 +473,41 @@ gone /home/builder && P "/home/builder is gone" || F "/home/builder is gone"
 grep -q "^${SHIP_USER:-johns}:" "$M/etc/passwd" 2>/dev/null && P "the shipped administrator account exists" || F "the shipped administrator account exists"
 [ -s "$M/home/${SHIP_USER:-johns}/.ssh/authorized_keys" ] && P "administrator authorized_keys is non-empty" || F "administrator authorized_keys is non-empty"
 [ -s "$M/root/.ssh/authorized_keys" ] && F "root authorized_keys is empty (no root login ships)" || P "root authorized_keys is empty (no root login ships)"
-[ -f "$M/etc/machine-id" ] && [ ! -s "$M/etc/machine-id" ] && P "/etc/machine-id is zero-length (ConditionFirstBoot will fire)" || F "/etc/machine-id is zero-length (ConditionFirstBoot will fire)"
+# ⚠ THE RATIONALE HERE WAS FALSE and is corrected. Truncating machine-id does
+# NOT make ConditionFirstBoot fire: that directive tests /run/systemd/first-boot,
+# PID 1 never created it, and the 2026-08-04 artifact shipped with a zero-length
+# machine-id AND a skipped switch-firstboot. The truncation is still right, for
+# the reason that was always real -- per-machine uniqueness.
+[ -f "$M/etc/machine-id" ] && [ ! -s "$M/etc/machine-id" ] && P "/etc/machine-id is zero-length (systemd mints a fresh one per machine)" || F "/etc/machine-id is zero-length (systemd mints a fresh one per machine)"
 [ -s "$M/etc/hostname" ] && F "/etc/hostname is empty (DMI derivation applies)" || P "/etc/hostname is empty (DMI derivation applies)"
 ls "$M"/etc/ssh/ssh_host_*_key >/dev/null 2>&1 && F "SSH host keys were removed by generalize" || P "SSH host keys were removed by generalize"
+
+# 🔴 THE STAMP MUST NOT SHIP. switch-firstboot.service is conditioned on this
+# file's ABSENCE, and the build guest reboots once between `prepare` and
+# `verify` -- which FIRES the unit and writes the stamp inside the image being
+# built. stage-generalize's do_finish removes it; if that ever regresses, the
+# artifact boots with identity setup already marked done: no hostname, no host
+# keys, no sshd, exactly the defect the stamp replaced. This assertion is the
+# only thing standing between that regression and a fleet-wide re-image.
+gone /var/lib/switch-firstboot.stamp \
+  && P "no first-boot stamp ships (else switch-firstboot is skipped on the artifact's first boot)" \
+  || F "a first-boot stamp SHIPS in the artifact -- switch-firstboot will be skipped and this image is unreachable"
+# The unit must no longer carry the directive that failed. Checked on the
+# INSTALLED unit, not on the repo asset: what ships is what matters.
+grep -q 'ConditionFirstBoot' "$M/etc/systemd/system/switch-firstboot.service" 2>/dev/null \
+  && F "the shipped switch-firstboot.service carries no ConditionFirstBoot (it evaluates false here)" \
+  || P "the shipped switch-firstboot.service carries no ConditionFirstBoot (it evaluates false here)"
+grep -qx 'ConditionPathExists=!/var/lib/switch-firstboot.stamp' "$M/etc/systemd/system/switch-firstboot.service" 2>/dev/null \
+  && P "the shipped switch-firstboot.service is conditioned on the stamp's absence" \
+  || F "the shipped switch-firstboot.service is not conditioned on the stamp"
+# The SECOND, INDEPENDENT trigger for remote access. Its absence is invisible
+# until the day switch-firstboot is skipped again -- which is the day it matters.
+[ -x "$M/usr/local/sbin/switch-sshd-keygen" ] \
+  && P "switch-sshd-keygen is installed and executable (the redundant path to a reachable switch)" \
+  || F "switch-sshd-keygen is installed and executable"
+grep -qx 'ConditionPathExists=!/etc/ssh/ssh_host_ed25519_key' "$M/etc/systemd/system/switch-sshd-keygen.service" 2>/dev/null \
+  && P "switch-sshd-keygen.service is conditioned on the KEY's absence, so it retries every boot" \
+  || F "switch-sshd-keygen.service is not conditioned on the host key's absence"
 
 # ------------------------------------------------------------ kernel + mlxsw (BUILD GATE)
 #
@@ -527,7 +587,7 @@ grep -qx 'RESUME=none' "$M/etc/initramfs-tools/conf.d/resume" 2>/dev/null && P "
 if [ -L "$M/etc/systemd/system/systemd-repart.service" ] && [ "$(readlink "$M/etc/systemd/system/systemd-repart.service")" = /dev/null ]; then
   P "shipped systemd-repart.service is masked to /dev/null"
 else F "shipped systemd-repart.service is masked to /dev/null"; fi
-for u in switch-growroot.service switch-firstboot.service switch-swapfile.service mlxsw-modules-present.service ssh.service; do
+for u in switch-growroot.service switch-firstboot.service switch-sshd-keygen.service switch-swapfile.service mlxsw-modules-present.service ssh.service; do
   st=$(systemctl is-enabled --root="$M" "$u" 2>/dev/null)
   [ "$st" = enabled ] && P "unit $u is enabled" || F "unit $u is enabled (got '${st:-missing}')"
 done
@@ -721,10 +781,25 @@ do_offline() {
 
 # ---------------------------------------------------------------- T2/T3 boots
 
-boot_artifact() { # $1 = mode (bios|uefi), $2 = size (native|grown), $3 = port index
-	local mode="$1" size="$2" idx="$3"
-	run_scope "$mode-$size" "$idx"
-	ALL_SCOPES+=("$mode-$size:$RUN_MON")
+boot_artifact() { # $1 = mode (bios|uefi), $2 = size (native|grown), $3 = port index, $4 = tag (optional)
+	local mode="$1" size="$2" idx="$3" tag="${4:-$1-$2}"
+	run_scope "$tag" "$idx"
+	ALL_SCOPES+=("$tag:$RUN_MON")
+
+	# The SMBIOS this run presents, and therefore the hostname it must produce.
+	# Defaults reproduce the four original runs exactly; the board-serial run
+	# overrides them to make switch-firstboot's second fallback rung reachable.
+	local sys_serial="${SMBIOS_SYS_SERIAL:-$DMI_SERIAL}"
+	local board_serial="${SMBIOS_BOARD_SERIAL:-}"
+	local -a smbios=(-smbios type=1,manufacturer="$DMI_VENDOR",product="$DMI_PRODUCT",serial="$sys_serial")
+	if [ -n "$board_serial" ]; then
+		smbios+=(-smbios type=2,serial="$board_serial")
+		# The system serial is a placeholder here, so the script must reject it
+		# and settle on the BOARD serial. That is the whole point of this run.
+		RUN_WANT_HOST="$(want_hostname "$DMI_PRODUCT" "$board_serial")"
+	else
+		RUN_WANT_HOST="$(want_hostname "$DMI_PRODUCT" "$sys_serial")"
+	fi
 
 	# 🔴 NEVER boot the artifact directly. Growth REPARTITIONS the disk it boots
 	# on; booting the raw file would mutate the very bytes under test and every
@@ -766,7 +841,7 @@ boot_artifact() { # $1 = mode (bios|uefi), $2 = size (native|grown), $3 = port i
 		-enable-kvm -machine q35 -cpu host \
 		-m "$MEM" -smp "$CPUS" \
 		"${fw[@]}" \
-		-smbios type=1,manufacturer="$DMI_VENDOR",product="$DMI_PRODUCT",serial="$DMI_SERIAL" \
+		"${smbios[@]}" \
 		-drive file="$RUN_DIR/disk.qcow2",if=none,id=root,format=qcow2 \
 		-device virtio-blk-pci,drive=root,bootindex=0 \
 		-netdev user,id=n0,hostfwd=tcp:127.0.0.1:"$RUN_SSH"-:22 \
@@ -851,19 +926,23 @@ assert_serial() { # $1 = mode, $2 = size
 	# and never reaches serial either. The getty banner does, and it carries the
 	# hostname -- which is the unit's own principal output, so this asserts that
 	# the unit ACHIEVED something rather than that it logged something.
-	local model tag want
-	model=$(printf '%s' "$DMI_PRODUCT" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9-' '-' | sed -e 's/--*/-/g' -e 's/^-//' -e 's/-$//')
-	tag=$(printf '%s' "$DMI_SERIAL" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9-' '-' | sed -e 's/--*/-/g' -e 's/^-//' -e 's/-$//' | tail -c 8)
-	want="mlnx-$model-$tag"
+	local want="$RUN_WANT_HOST"
 	if grep -qa "$want login:" "$s"; then
 		ok "$RUN_TAG: switch-firstboot derived the hostname from DMI ('$want' on the login banner)"
 	else
 		bad "$RUN_TAG: switch-firstboot derived the hostname from DMI -- banner shows '$(grep -aoE '^[A-Za-z0-9.-]+ login:' "$s" | tail -1)', wanted '$want login:'"
 	fi
+	# 🔴 NEVER 'localhost'. That is the name an artifact wears when identity setup
+	# did not run at all, and it is the single most diagnostic string in this
+	# whole file -- the 2026-08-04 artifact showed it on all four runs while
+	# every other assertion about the boot passed.
+	grep -qaE '^localhost login:' "$s" \
+		&& bad "$RUN_TAG: the login banner is not 'localhost' (that name means switch-firstboot never ran)" \
+		|| ok "$RUN_TAG: the login banner is not 'localhost'"
 	# Its other principal output: the host keys sshd cannot start without.
 	grep -qa 'Failed to start ssh.service' "$s" \
-		&& bad "$RUN_TAG: sshd started (switch-firstboot regenerated the host keys it needs)" \
-		|| ok "$RUN_TAG: sshd started (switch-firstboot regenerated the host keys it needs)"
+		&& bad "$RUN_TAG: sshd started (the host keys were regenerated at first boot)" \
+		|| ok "$RUN_TAG: sshd started (the host keys were regenerated at first boot)"
 	if [ "$mode" = uefi ]; then
 		grep -qiE 'EFI stub|efi:' "$s" && ok "$RUN_TAG: the kernel reports an EFI boot (the UEFI path really was taken)" \
 		                               || bad "$RUN_TAG: the kernel reports an EFI boot (the UEFI path really was taken)"
@@ -888,18 +967,41 @@ assert_online() { # $1 = mode, $2 = size
 	fi
 
 	# Hostname derivation, made discriminating by the synthetic DMI above.
-	local model tag want
-	model=$(printf '%s' "$DMI_PRODUCT" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9-' '-' | sed -e 's/--*/-/g' -e 's/^-//' -e 's/-$//')
-	tag=$(printf '%s' "$DMI_SERIAL" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9-' '-' | sed -e 's/--*/-/g' -e 's/^-//' -e 's/-$//' | tail -c 8)
-	want="mlnx-$model-$tag"
+	local want="$RUN_WANT_HOST"
 	v="$(g 'cat /etc/hostname')"
 	if [ "$v" = "$want" ]; then ok "$RUN_TAG: hostname derived from DMI is exactly '$want'"
 	else bad "$RUN_TAG: hostname derived from DMI is exactly '$want' (got '${v:-empty}')"; fi
 
 	v="$(g 'cat /etc/machine-id')"
 	[ -n "$v" ] && ok "$RUN_TAG: machine-id was regenerated at first boot" || bad "$RUN_TAG: machine-id was regenerated at first boot"
+
+	# 🔴 THE TRIGGER, OBSERVED RATHER THAN INFERRED. This is the assertion whose
+	# absence let the original defect ship: the unit was enabled, its file was
+	# correct, and it never ran. `systemctl show -p ConditionResult` is systemd's
+	# own answer about its own decision, and after a successful first boot the
+	# stamp exists -- so the expected answer here is "no", for the right reason.
+	v="$(g 'systemctl show -p ConditionResult --value switch-firstboot.service')"
+	local st; st="$(g 'test -e /var/lib/switch-firstboot.stamp && echo yes || echo no')"
+	if [ "$st" = yes ]; then
+		ok "$RUN_TAG: switch-firstboot RAN and left its stamp (so it will be skipped, correctly, on every later boot)"
+	else
+		bad "$RUN_TAG: switch-firstboot RAN and left its stamp -- no stamp exists, so it did not complete (ConditionResult=${v:-unknown})"
+	fi
+	v="$(g 'systemctl is-active switch-firstboot.service')"
+	[ "$v" = active ] && ok "$RUN_TAG: switch-firstboot.service is active (RemainAfterExit) rather than skipped" \
+		|| bad "$RUN_TAG: switch-firstboot.service is active rather than skipped (got '${v:-unknown}')"
+
 	v="$(g 'ls -1 /etc/ssh/ssh_host_*_key 2>/dev/null | wc -l')"
 	[ "${v:-0}" -ge 1 ] && ok "$RUN_TAG: SSH host keys were regenerated at first boot ($v)" || bad "$RUN_TAG: SSH host keys were regenerated at first boot"
+	# ed25519 ONLY, by ruling. Counted at runtime because the offline tier sees
+	# an artifact with NO host keys at all -- this is the only tier that can.
+	v="$(g 'ls -1 /etc/ssh/ssh_host_*_key 2>/dev/null | wc -l')"
+	[ "${v:-0}" = 1 ] && ok "$RUN_TAG: exactly one host key type exists (ed25519 only, by ruling)" \
+		|| bad "$RUN_TAG: exactly one host key type exists (ed25519 only) -- found ${v:-0}: $(g 'ls -1 /etc/ssh/ssh_host_*_key 2>/dev/null | tr "\n" " "')"
+	v="$(g 'ssh-keygen -l -f /etc/ssh/ssh_host_ed25519_key.pub 2>/dev/null')"
+	printf '%s' "$v" | grep -q "$want" \
+		&& ok "$RUN_TAG: the host key's comment carries the derived hostname (set_hostname ran before keygen)" \
+		|| bad "$RUN_TAG: the host key's comment carries the derived hostname (got: ${v:-nothing})"
 
 	# --- growth outcome. THE OUTCOME, never a unit's exit status.
 	local disk root
@@ -979,6 +1081,19 @@ do_boot() {
 	boot_artifact bios grown  2
 	boot_artifact uefi native 3
 	boot_artifact uefi grown  4
+	# 🔴 THE FIFTH RUN EXISTS FOR ONE RUNG. switch-firstboot falls back
+	# product_serial -> board_serial -> machine-id, and the middle rung was added
+	# from an Arch observation: a machine whose PRODUCT serial is a placeholder
+	# can still carry a valid BASEBOARD serial. Without this run that rung is
+	# code nothing ever takes -- and an untaken fallback is indistinguishable
+	# from a broken one until the day a switch needs it.
+	#
+	# The system serial is set to a real placeholder rather than left unset, so
+	# usable_serial() must REJECT it by pattern for this run to pass. If the
+	# rejection list ever stops covering "Not Specified", the derived hostname
+	# becomes mlnx-<product>-specified and this run goes red.
+	SMBIOS_SYS_SERIAL="$DMI_SERIAL_PLACEHOLDER" SMBIOS_BOARD_SERIAL="$DMI_BOARD_SERIAL" \
+		boot_artifact bios native 5 bios-board-serial
 }
 
 # ---------------------------------------------------------------- selftest
@@ -1268,6 +1383,23 @@ do_selftest() {
 	has 'file="\$RUN_DIR/disk.qcow2",if=none,id=root' "boots a per-run overlay, never the artifact file itself"
 	has 'qemu-img create -q -f qcow2 -b "\$IMAGE" -F raw' "the overlay is backed by the artifact (the bytes under test are the shipped ones)"
 	has 'smbios type=1' "synthetic DMI is supplied so hostname derivation is discriminating"
+	# 🔴 THE BOARD-SERIAL RUNG. Present as a qemu option AND as a run that uses
+	# it: a type=2 option nothing passes would be a fallback path with no test.
+	has 'smbios type=2,serial=' "the BASEBOARD serial can be driven too (switch-firstboot's second fallback rung)"
+	has 'bios-board-serial' "a run exists that presents a placeholder system serial and a valid board serial"
+	has 'SMBIOS_BOARD_SERIAL="\$DMI_BOARD_SERIAL"' "and that run is the one wired to the board serial"
+	# 🔴 THE OFF-BY-ONE. `sanitize | tail -c 8` counts sed's trailing NEWLINE as
+	# one of the eight bytes and returns SEVEN characters. Harness and script
+	# agreed on the wrong answer, so the assertion passed while both were wrong
+	# against the documented "last 8". The inner printf is the fix, in both files.
+	has 'printf .%s. "\$\(sanitize_dmi "\$2"\)" | tail -c 8' \
+		"the expected hostname strips the trailing newline before counting 8 bytes (or it silently yields 7)"
+	has 'RUN_WANT_HOST' "the expected hostname is PER RUN (the board-serial run must expect a different name)"
+	# The single most diagnostic string in the 2026-08-04 failure.
+	has 'localhost login:' "'localhost' on the banner is explicitly a FAILURE (it is what an artifact wears when identity setup never ran)"
+	has 'ConditionResult --value switch-firstboot' \
+		"the trigger is read from systemd's OWN verdict at runtime -- the check whose absence let a correct-looking, never-running unit ship"
+	has 'switch-firstboot.stamp' "the offline tier asserts the first-boot stamp does not ship in the artifact"
 
 	# --- the growth branches really differ
 	local b

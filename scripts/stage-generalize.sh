@@ -74,7 +74,13 @@ set -euo pipefail
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(dirname -- "$HERE")"
-ASSETS="$ROOT/assets"
+# Overridable for ONE reason: mutation-testing the selftest. Point it at a copy
+# of assets/ with a single directive broken and the assertions about that
+# directive must go red -- which is the only way to know a guard can fail at all.
+# 🔴 It is the ASSETS that get mutated, never a copy of this script: a generated
+# `pkill -f qemu-system` inside a mutated script destroyed the build VM on
+# 2026-08-03. Mutate DATA, run the REAL code.
+ASSETS="${ASSETS:-$ROOT/assets}"
 
 # ---------------------------------------------------------------- config
 # MIRRORED from scripts/vm.sh, deliberately, with identical environment
@@ -267,6 +273,15 @@ do_prepare() {
 	push_file "$ASSETS/etc.repart.d/50-root.conf"                  /etc/repart.d/50-root.conf         0644
 	push_file "$ASSETS/usr.local.sbin/switch-firstboot"            /usr/local/sbin/switch-firstboot   0755
 	push_file "$ASSETS/etc.systemd.system/switch-firstboot.service" /etc/systemd/system/switch-firstboot.service 0644
+	# 🔴 The SECOND, INDEPENDENT trigger for host-key generation. The artifact of
+	# 2026-08-04 shipped unreachable because switch-firstboot.service was the sole
+	# custodian of remote access and its condition was false. This unit runs the
+	# SAME script, conditioned on the absence of the key itself, so it retries on
+	# every boot that lacks one. Debian's own sshd-keygen.service cannot serve:
+	# it carries ConditionFirstBoot=yes too (read off the shipped artifact), and
+	# its ssh-keygen -A mints rsa and ecdsa keys the ed25519-only ruling excludes.
+	push_file "$ASSETS/usr.local.sbin/switch-sshd-keygen"          /usr/local/sbin/switch-sshd-keygen 0755
+	push_file "$ASSETS/etc.systemd.system/switch-sshd-keygen.service" /etc/systemd/system/switch-sshd-keygen.service 0644
 	# Swap is NOT identity, so it is a second unit rather than a branch of the
 	# first one: switch-firstboot.service is identity-only by ruling, and it
 	# has no business waiting on the growth chain.
@@ -313,8 +328,8 @@ do_prepare() {
 	GUEST
 
 	decide_grow_unit
-	info "enabling the first-boot units (identity, swapfile)"
-	ssh_vm 'sudo sh -c "systemctl daemon-reload && systemctl enable switch-firstboot.service switch-swapfile.service"'
+	info "enabling the first-boot units (identity, host key, swapfile)"
+	ssh_vm 'sudo sh -c "systemctl daemon-reload && systemctl enable switch-firstboot.service switch-sshd-keygen.service switch-swapfile.service"'
 
 	# The swapfile's only real precondition, asserted here rather than
 	# discovered at first boot on a switch: a plain swapfile is INVALID on
@@ -617,6 +632,34 @@ do_verify() {
 		|| bad "/usr/local/sbin/switch-firstboot missing"
 	systemctl is-enabled switch-firstboot.service >/dev/null 2>&1 \
 		&& ok "switch-firstboot.service enabled" || bad "switch-firstboot.service is not enabled"
+	# The second, independent trigger for remote access.
+	[ -x /usr/local/sbin/switch-sshd-keygen ] && ok "/usr/local/sbin/switch-sshd-keygen present" \
+		|| bad "/usr/local/sbin/switch-sshd-keygen missing (switch-firstboot delegates host keys to it)"
+	systemctl is-enabled switch-sshd-keygen.service >/dev/null 2>&1 \
+		&& ok "switch-sshd-keygen.service enabled" || bad "switch-sshd-keygen.service is not enabled"
+	# 🔴 THE CONDITION ACTUALLY EVALUATED, in the guest, by systemd itself --
+	# not the file's text. This is the assertion that would have caught the
+	# original defect: ConditionFirstBoot=yes read correct and evaluated false.
+	# In the build guest the stamp EXISTS (the post-prepare reboot ran the unit),
+	# so the expected result here is "no". What matters is that systemd answers
+	# at all and that the answer tracks the stamp.
+	# ⚠ `|| true` is NOT decoration. An unguarded `x=$(cmd)` aborts the whole
+	# payload under `set -e` with no message -- the iter-13 defect that hid a
+	# broken installer for three sessions.
+	CR=$(systemctl show -p ConditionResult --value switch-firstboot.service 2>/dev/null || true)
+	if [ -e /var/lib/switch-firstboot.stamp ]; then
+		[ "$CR" = no ] && ok "switch-firstboot's condition tracks the stamp (stamp present -> ConditionResult=$CR)" \
+			|| bad "the stamp exists but switch-firstboot's ConditionResult is '$CR' -- the condition is not reading the stamp"
+		note "/var/lib/switch-firstboot.stamp exists in the guest (the post-prepare reboot ran the unit); finish removes it"
+	else
+		[ "$CR" = yes ] && ok "switch-firstboot's condition tracks the stamp (no stamp -> ConditionResult=$CR)" \
+			|| bad "no stamp exists but switch-firstboot's ConditionResult is '$CR'"
+	fi
+	# The old mechanism must be gone from the unit as SHIPPED IN THE GUEST, not
+	# merely from the asset in the repo.
+	grep -q 'ConditionFirstBoot' /etc/systemd/system/switch-firstboot.service \
+		&& bad "the installed switch-firstboot.service still carries ConditionFirstBoot -- it evaluates false on the artifact" \
+		|| ok "the installed switch-firstboot.service carries no ConditionFirstBoot"
 
 	echo "== swap (AD-4: a FILE, never a partition) =="
 	[ -x /usr/local/sbin/switch-swapfile ] && ok "/usr/local/sbin/switch-swapfile present" \
@@ -727,8 +770,14 @@ do_finish() {
 
 	# --- identity ------------------------------------------------------
 	# TRUNCATED, not deleted: machine-id(5) makes an empty file the documented
-	# "not yet provisioned" state, and it is what makes ConditionFirstBoot=yes
-	# fire for switch-firstboot.service on the artifact's first boot.
+	# "not yet provisioned" state, so systemd mints a fresh one per machine.
+	# ⚠ THAT IS ALL IT DOES. This comment used to claim the truncation is "what
+	# makes ConditionFirstBoot=yes fire", and that claim is FALSE -- measured on
+	# the 2026-08-04 artifact, which shipped machine-id at zero length and still
+	# had ConditionFirstBoot evaluate false, because the condition tests
+	# /run/systemd/first-boot and PID 1 never created it. switch-firstboot.service
+	# no longer uses ConditionFirstBoot at all; the truncation stays because
+	# per-machine uniqueness was always its real justification.
 	: > /etc/machine-id
 	rm -f /var/lib/dbus/machine-id
 	rm -f /etc/ssh/ssh_host_*
@@ -736,6 +785,15 @@ do_finish() {
 	# these is a fleet sharing an identity.
 	rm -f /var/lib/systemd/random-seed /var/lib/systemd/credential.secret
 	rm -f /etc/hostname
+	# 🔴 THE STAMP MUST NOT SHIP, and this line is the whole reason the fix works.
+	# switch-firstboot.service is conditioned on this file's ABSENCE, and the
+	# build guest reboots once between `prepare` and `verify` -- which fires the
+	# unit and writes the stamp INSIDE the image being built. Leave it here and
+	# the artifact's first boot skips identity setup permanently: no hostname, no
+	# host keys, no sshd. Exactly the defect this replaced, arriving by a new
+	# route. Same reasoning as /swapfile below, which a build reboot also creates.
+	# boot-test.sh's offline tier asserts the stamp is absent from the artifact.
+	rm -f /var/lib/switch-firstboot.stamp
 	if [ -f /etc/hosts ]; then
 		grep -v '^127\.0\.1\.1[[:space:]]' /etc/hosts > /tmp/hosts.new || true
 		cat /tmp/hosts.new > /etc/hosts; rm -f /tmp/hosts.new
@@ -1497,6 +1555,8 @@ do_selftest() {
 	assert_pushed etc.repart.d/50-root.conf                   /etc/repart.d/50-root.conf                   0644
 	assert_pushed usr.local.sbin/switch-firstboot             /usr/local/sbin/switch-firstboot             0755
 	assert_pushed etc.systemd.system/switch-firstboot.service /etc/systemd/system/switch-firstboot.service 0644
+	assert_pushed usr.local.sbin/switch-sshd-keygen           /usr/local/sbin/switch-sshd-keygen           0755
+	assert_pushed etc.systemd.system/switch-sshd-keygen.service /etc/systemd/system/switch-sshd-keygen.service 0644
 	assert_pushed usr.local.sbin/switch-swapfile              /usr/local/sbin/switch-swapfile              0755
 	assert_pushed etc.systemd.system/switch-swapfile.service  /etc/systemd/system/switch-swapfile.service  0644
 	# 🔴 preflight FIRST. `prepare` that ran before its preconditions were met
@@ -1520,8 +1580,16 @@ do_selftest() {
 		| grep -qF "printf 'RESUME=none\\n' > /etc/initramfs-tools/conf.d/resume" \
 		&& ok "prepare WRITES RESUME=none (a stale RESUME= cost a hand-fixed initramfs on the 2410)" \
 		|| bad "RESUME=none is never written"
-	grep -qF 'systemctl enable switch-firstboot.service switch-swapfile.service' "$SHIM_DIR/ledger" \
-		&& ok "both first-boot units are enabled, in one call" || bad "the first-boot units are not enabled together"
+	grep -qF 'systemctl enable switch-firstboot.service switch-sshd-keygen.service switch-swapfile.service' "$SHIM_DIR/ledger" \
+		&& ok "all three first-boot units are enabled, in one call" || bad "the first-boot units are not enabled together"
+	# 🔴 NAMED SEPARATELY, because the assertion above passes on a single string
+	# and the unit that matters most is the newest one. An artifact that ships
+	# switch-sshd-keygen.service present-but-not-enabled is an artifact whose
+	# only redundant path to remote access is inert -- which is indistinguishable
+	# from the defect of 2026-08-04 until the day switch-firstboot is skipped.
+	grep -qF 'switch-sshd-keygen.service' "$SHIM_DIR/ledger" \
+		&& ok "switch-sshd-keygen.service is enabled (the second, independent trigger for remote access)" \
+		|| bad "switch-sshd-keygen.service is never enabled -- host-key generation has a single point of failure again"
 	payload_code "$(payload_index 'findmnt -no FSTYPE' || echo 0)" 2>/dev/null | grep -qE '^[[:space:]]*btrfs\)' \
 		&& ok "prepare asserts the root filesystem can carry a plain swapfile (a btrfs case arm that refuses)" \
 		|| bad "the swapfile filesystem precondition is not checked"
@@ -1685,7 +1753,12 @@ do_selftest() {
 	                                                    || bad "the sudo insurance would reach a switch"
 	grep -q 'rm -f /etc/ssh/ssh_host_' "$FIN" && ok "the SSH host keys are deleted (a fleet sharing one is a fleet sharing an identity)" \
 	                                          || bad "the host keys survive generalization"
-	grep -q ': > /etc/machine-id' "$FIN" && ok "machine-id is TRUNCATED, not deleted (that is what makes ConditionFirstBoot= fire)" \
+	# ⚠ The RATIONALE in this message was FALSE until 2026-08-04: truncating
+	# machine-id does NOT make ConditionFirstBoot fire -- that directive tests
+	# /run/systemd/first-boot, which PID 1 never created on this artifact. The
+	# truncation stays for the reason that was always real: a fleet sharing one
+	# machine-id is a fleet sharing an identity.
+	grep -q ': > /etc/machine-id' "$FIN" && ok "machine-id is TRUNCATED, not deleted (machine-id(5)'s documented unprovisioned state, so systemd mints a fresh one per machine)" \
 	                                     || bad "machine-id is not truncated"
 	[ ! -e "$FAKE_WORK/qemu.pid" ] && ok "the pidfile is removed once the guest is down" || bad "the pidfile survives a successful finish"
 	assert_no_forbidden_traffic finish
@@ -1773,13 +1846,15 @@ do_selftest() {
 		&& ok "the default artifact name is mlnx-sw-os-<distro>-<UTC date>.raw" || bad "the default artifact name is wrong"
 
 	# ------------------------------------------------------------------ S10
-	hdr "S10 the six assets this stage owns"
+	hdr "S10 the eight assets this stage owns"
 	local RP="$ASSETS/etc.repart.d/50-root.conf"
 	local FU="$ASSETS/etc.systemd.system/switch-firstboot.service"
 	local SU="$ASSETS/etc.systemd.system/switch-swapfile.service"
 	local GU="$ASSETS/etc.systemd.system/switch-growroot.service"
 	local FS="$ASSETS/usr.local.sbin/switch-firstboot"
 	local SS="$ASSETS/usr.local.sbin/switch-swapfile"
+	local KU="$ASSETS/etc.systemd.system/switch-sshd-keygen.service"
+	local KS="$ASSETS/usr.local.sbin/switch-sshd-keygen"
 
 	# 50-root.conf -- one file, every disk.
 	forbid_in "$RP" '^[[:space:]]*Device=' "50-root.conf pins a Device= (it must work on vda, sda and nvme0n1 with no branching)"
@@ -1793,7 +1868,58 @@ do_selftest() {
 		|| bad "50-root.conf carries $(sed 's/#.*//' "$RP" | grep -c '[^[:space:]]') directives, expected 2"
 
 	# switch-firstboot.service -- identity only, Condition never Assert.
-	grep -qx 'ConditionFirstBoot=yes' "$FU" && ok "switch-firstboot.service uses ConditionFirstBoot=yes" || bad "switch-firstboot.service has no ConditionFirstBoot=yes"
+	#
+	# 🔴 THE TRIGGER, and the assertion that replaced its opposite. This file used
+	# to REQUIRE ConditionFirstBoot=yes. That requirement is what shipped an
+	# unreachable artifact on 2026-08-04: the directive read correct and evaluated
+	# FALSE, because it tests /run/systemd/first-boot -- which PID 1 never created
+	# -- and not /etc/machine-id, which stage-generalize does truncate. The stamp
+	# is owned by this project, is written by the script only on success, and
+	# therefore RETRIES a failed run on the next boot. ConditionFirstBoot could
+	# not, by construction: it was true exactly once whether or not anything ran.
+	grep -qx 'ConditionPathExists=!/var/lib/switch-firstboot.stamp' "$FU" \
+		&& ok "switch-firstboot.service is conditioned on the stamp's ABSENCE, so a failed run retries next boot" \
+		|| bad "switch-firstboot.service is not conditioned on /var/lib/switch-firstboot.stamp"
+	forbid_in "$FU" '^[[:space:]]*ConditionFirstBoot' \
+		"switch-firstboot.service uses ConditionFirstBoot (it evaluates FALSE on this artifact -- measured 2026-08-04 -- and it can never retry)"
+	# 🔴 THE STAMP MUST NOT SHIP. The build guest reboots between prepare and
+	# verify, which fires the unit and writes the stamp into the image. Without
+	# this removal the artifact's first boot skips identity setup permanently --
+	# the same defect, arriving by the route the fix opened.
+	grep -q 'rm -f /var/lib/switch-firstboot.stamp' "$FIN" \
+		&& ok "finish removes the first-boot stamp a build-time reboot created (else the artifact ships with identity setup already 'done')" \
+		|| bad "finish does not remove /var/lib/switch-firstboot.stamp -- the stamp ships and the artifact never runs switch-firstboot"
+	# ⚠ THE WRITE, not the word. The file names STAMP in an assignment, in a
+	# mkdir and in a log line; a mutation that deleted only the redirection would
+	# leave three matches standing and this assertion green.
+	code_of "$FS" | grep -qE '>[[:space:]]*"\$STAMP"' \
+		&& ok "the switch-firstboot script WRITES the stamp its unit is conditioned on" \
+		|| bad "the switch-firstboot script never writes the stamp -- the unit would fire on every boot, forever"
+	# 🔴 POSITION, not presence. The stamp is worthless if it is written before
+	# the work: a failure would then be recorded as a success and never retried.
+	# The whole retry property depends on this ordering.
+	#
+	# ⚠ Both line numbers are captured and CHECKED FOR EMPTINESS first. A bare
+	# `[ "$(grep -n …)" -lt "$(grep -n …)" ]` with one side missing is a shell
+	# ERROR reported as an ordering failure -- a true verdict with a false reason,
+	# which is how a later reader gets sent to the wrong line. Observed while
+	# mutation-testing this very assertion.
+	# ⚠ `|| true` on BOTH. This script runs under `set -euo pipefail`, so a grep
+	# that matches nothing fails its pipeline and an unguarded `x=$(…)` ABORTS
+	# THE WHOLE SELFTEST -- silently, mid-run, with a zero-failure tally that
+	# never printed. Caught by mutation-testing this very block: the mutant that
+	# deletes the stamp write reported one failure and then no summary line at
+	# all. Same defect as the iter-13 installer that died on `r="$(repo_dropin)"`.
+	local L_WORK L_STAMP
+	L_WORK=$(code_of "$FS" | grep -n 'set_dbus_machine_id$' | tail -1 | cut -d: -f1 || true)
+	L_STAMP=$(code_of "$FS" | grep -nE '>[[:space:]]*"\$STAMP"' | tail -1 | cut -d: -f1 || true)
+	if [ -z "$L_WORK" ] || [ -z "$L_STAMP" ]; then
+		bad "cannot check stamp ordering: identity work at line '${L_WORK:-missing}', stamp write at line '${L_STAMP:-missing}'"
+	elif [ "$L_WORK" -lt "$L_STAMP" ]; then
+		ok "the stamp is written AFTER the identity work, so a failed run leaves no stamp and retries"
+	else
+		bad "the stamp is written before the identity work completes -- a failure would be recorded as success and never retried"
+	fi
 	# 🔴 A unit ordered Before=systemd-networkd.service MUST NOT also carry the
 	# implicit After=basic.target that DefaultDependencies adds: networkd is
 	# needed before basic.target, so the two close an ordering cycle. Measured on
@@ -1824,12 +1950,27 @@ do_selftest() {
 		"the switch-firstboot script grows or swaps anything (systemd-repart and x-systemd.growfs own growth)"
 	forbid_in "$FS" '(netplan|networkctl|ip[[:space:]]+addr|ip[[:space:]]+link|nmcli|dhclient)' \
 		"the switch-firstboot script touches the network (the shipped networkd units are the sole authority)"
-	# ⚠ COMMAND POSITION. The file also says "no SSH host keys after ssh-keygen -A"
-	# inside an error message, and a plain grep passed on that alone after the
-	# call itself had been deleted.
-	code_of "$FS" | grep -qE '^[[:space:]]*ssh-keygen[[:space:]]+-A[[:space:]]*$' \
-		&& ok "switch-firstboot actually RUNS ssh-keygen -A (the host keys generalization deleted)" \
-		|| bad "switch-firstboot does not run ssh-keygen -A"
+	# 🔴 `ssh-keygen -A` IS GONE, and its assertion is INVERTED rather than
+	# deleted, so a future edit that reinstates it fails a test. Two reasons it
+	# went: the ed25519-only ruling (rsa and ecdsa host keys are not wanted), and
+	# the delegation below, which is what gives host-key generation a second,
+	# independent trigger.
+	forbid_in "$FS" '^[[:space:]]*ssh-keygen[[:space:]]+-A' \
+		"switch-firstboot runs ssh-keygen -A (it mints rsa and ecdsa keys the ed25519-only ruling excludes; generation belongs to switch-sshd-keygen)"
+	# ⚠ COMMAND POSITION, the lesson that survived from the -A assertion: the
+	# file names $KEYGEN in an assignment and in a warning string, so presence
+	# proves nothing. Only the invocation does.
+	code_of "$FS" | grep -qE '^[[:space:]]*"\$KEYGEN"[[:space:]]*$' \
+		&& ok "switch-firstboot INVOKES the shared keygen script (one implementation, two triggers)" \
+		|| bad "switch-firstboot never invokes \$KEYGEN -- host keys would not be regenerated at first boot"
+	# 🔴 ORDERING IS LOAD-BEARING: the key's comment is the derived hostname, so
+	# the keys call must follow set_hostname. Reversed, every switch in the fleet
+	# gets a host key commented with an empty name -- cosmetic, but it would be
+	# permanent and unnoticed.
+	[ "$(code_of "$FS" | grep -n '^set_hostname$' | tail -1 | cut -d: -f1)" \
+	  -lt "$(code_of "$FS" | grep -n '^set_ssh_host_keys$' | tail -1 | cut -d: -f1)" ] \
+		&& ok "set_hostname runs BEFORE set_ssh_host_keys (the host key's comment carries the derived name)" \
+		|| bad "set_ssh_host_keys runs before set_hostname -- the key comment would be empty"
 	code_of "$FS" | grep -q '/sys/class/dmi/id' && ok "switch-firstboot derives the hostname from DMI (AD-5: no identity baked into the artifact)" || bad "switch-firstboot does not read DMI"
 	code_of "$FS" | grep -q 'hostname already set' && ok "switch-firstboot leaves a pre-seeded /etc/hostname alone (the supported way to apply a site convention)" \
 	                                               || bad "switch-firstboot would clobber a pre-seeded hostname"
@@ -1842,6 +1983,184 @@ do_selftest() {
 		"the switch-firstboot script uses a bashism"
 	forbid_in "$SS" '(\[\[[[:space:]]|[[:space:]]declare[[:space:]]|^[[:space:]]*local[[:space:]]|[[:space:]]=~[[:space:]])' \
 		"the switch-swapfile script uses a bashism"
+	# The hostname fallback chain. product_serial -> board_serial -> machine-id.
+	# 🔴 board_serial is the rung added 2026-08-04 from an Arch observation: the
+	# PRODUCT serial can be a placeholder while the BASEBOARD serial is valid.
+	code_of "$FS" | grep -q 'board_serial' \
+		&& ok "switch-firstboot falls back to DMI board_serial (observed valid where product_serial is a placeholder)" \
+		|| bad "switch-firstboot has no board_serial rung -- a switch whose product_serial is junk falls straight to machine-id"
+	forbid_in "$FS" '(date[[:space:]]+\+%|EPOCHSECONDS)' \
+		"switch-firstboot mints a hostname from a TIMESTAMP (two switches imaged and booted in the same second collide; machine-id cannot)"
+
+	# 🔴 RUN THE PURE HELPERS. Everything above is text; sanitize() and
+	# usable_serial() decide what every switch in the fleet is CALLED, and until
+	# now nothing had ever executed them. Only the two function definitions are
+	# extracted -- the script's top-level body writes /etc/hostname and must not
+	# run here -- so this executes the shipped code without executing the shipped
+	# effects. It is the same discipline as mutating assets rather than scripts.
+	# ⚠ ONE range, not two. sanitize() is a `; }` one-liner with no line starting
+	# `}`, so a `/^sanitize() {/,/^}/p;/^usable_serial() {/,/^}/p` pair ran both
+	# ranges to usable_serial's brace and emitted the block TWICE. The result did
+	# not parse, every call failed, and "usable_serial rejects <placeholder>"
+	# printed PASS five times -- a guard that could not fail, reporting green
+	# about code it had never executed. It was caught only by the POSITIVE
+	# controls below. Keep them: they are what makes this block falsifiable.
+	local HF="$W/firstboot-helpers.sh"
+	sed -n '/^sanitize() {/,/^}/p' "$FS" > "$HF"
+	sh -n "$HF" 2>/dev/null \
+		&& ok "the extracted hostname helpers parse as shell" \
+		|| bad "the extracted hostname helpers do not parse -- every assertion below would silently fail-as-reject"
+	# 🔴 VACUITY GUARD. Both names must actually be DEFINED after sourcing, or
+	# the calls below fail with 'command not found' and read as a rejection.
+	if sh -c '. '"$HF"'; command -v sanitize >/dev/null && command -v usable_serial >/dev/null' 2>/dev/null; then
+		ok "both hostname helpers are defined after sourcing (sanitize, usable_serial)"
+	else
+		bad "the hostname helpers are not defined after sourcing -- the assertions below are vacuous"
+	fi
+	# The 2410's quoted serial and the 2700's bare one must normalise identically.
+	local V
+	V=$(sh -c '. '"$HF"'; sanitize "\"MT1640X11886\""' 2>/dev/null || true)
+	[ "$V" = mt1640x11886 ] && ok "sanitize strips the 2410's QUOTED DMI serial to 'mt1640x11886'" \
+		|| bad "sanitize mishandles a quoted DMI serial (got '${V:-nothing}')"
+	V=$(sh -c '. '"$HF"'; sanitize "MSN2410-BB2FC"' 2>/dev/null || true)
+	[ "$V" = msn2410-bb2fc ] && ok "sanitize keeps hyphens in the product name ('msn2410-bb2fc')" \
+		|| bad "sanitize mangles the product name (got '${V:-nothing}')"
+	# 🔴 THE TAG IS EIGHT CHARACTERS, and this is why the inner printf exists:
+	# `sanitize … | tail -c 8` counts sed's trailing NEWLINE and yields SEVEN.
+	V=$(sh -c '. '"$HF"'; printf "%s" "$(sanitize "BT0001TEST")" | tail -c 8' 2>/dev/null || true)
+	[ "$V" = 0001test ] && ok "the hostname tag is the last EIGHT characters ('0001test'), not seven" \
+		|| bad "the hostname tag is off by one -- got '${V:-nothing}', wanted '0001test'"
+	# 🔴 EVERY PLACEHOLDER THIS PROJECT HAS ACTUALLY SEEN. "Not Specified" is what
+	# boot-test's board-serial run presents as the system serial: if this list
+	# stops covering it, that run derives a name from the placeholder and the
+	# board_serial rung is never reached.
+	local BAD_SER
+	for BAD_SER in "Not Specified" "To Be Filled By O.E.M." "Default string" "None" "0123456789"; do
+		if sh -c '. '"$HF"'; usable_serial "$1"' _ "$BAD_SER" 2>/dev/null; then
+			bad "usable_serial ACCEPTS the placeholder '$BAD_SER' -- a fleet of switches would share a hostname derived from it"
+		else
+			ok "usable_serial rejects the placeholder '$BAD_SER'"
+		fi
+	done
+	for BAD_SER in "MT1640X11886" "MB0002TEST"; do
+		if sh -c '. '"$HF"'; usable_serial "$1"' _ "$BAD_SER" 2>/dev/null; then
+			ok "usable_serial ACCEPTS the real serial '$BAD_SER'"
+		else
+			bad "usable_serial rejects the real serial '$BAD_SER' -- every switch would fall through to machine-id"
+		fi
+	done
+
+	# ------------------------------------------------------------------ S10b
+	# switch-sshd-keygen -- the SECOND, INDEPENDENT trigger for remote access.
+	hdr "S10b switch-sshd-keygen: the redundant path to a reachable switch"
+	# 🔴 THE CONDITION IS THE SYMPTOM, not a boot heuristic. This is the entire
+	# difference between "the switch is unreachable" and "the switch is reachable
+	# with a generic hostname" on hardware whose only other access is a serial
+	# console.
+	grep -qx 'ConditionPathExists=!/etc/ssh/ssh_host_ed25519_key' "$KU" \
+		&& ok "switch-sshd-keygen.service is conditioned on the KEY's absence, so it retries on every boot that lacks one" \
+		|| bad "switch-sshd-keygen.service is not conditioned on the host key's absence"
+	forbid_in "$KU" 'ConditionFirstBoot' \
+		"switch-sshd-keygen.service uses ConditionFirstBoot -- the exact directive that made Debian's own sshd-keygen.service useless here"
+	forbid_in "$KU" '^[[:space:]]*Assert' \
+		"switch-sshd-keygen.service uses an Assert* directive (a failed Assert marks the unit FAILED)"
+	grep -qx 'DefaultDependencies=no' "$KU" \
+		&& ok "switch-sshd-keygen.service sets DefaultDependencies=no (Before=ssh.socket plus the implicit After=basic.target is an ordering cycle: ssh.socket is ordered before sockets.target, which is part of basic.target)" \
+		|| bad "switch-sshd-keygen.service keeps the implicit After=basic.target AND orders itself before ssh.socket -- that is an ordering cycle"
+	grep -qx 'Conflicts=shutdown.target' "$KU" \
+		&& ok "and it re-adds the shutdown conflict that DefaultDependencies=no removes" \
+		|| bad "DefaultDependencies=no without Conflicts=shutdown.target leaves the unit running into shutdown"
+	grep -qE '^Before=.*[[:space:]]ssh\.service|^Before=ssh\.service' "$KU" && grep -qE '^Before=.*sshd\.service' "$KU" \
+		&& ok "switch-sshd-keygen.service is ordered before BOTH sshd spellings (the name differs by distro)" \
+		|| bad "switch-sshd-keygen.service does not order before both sshd spellings"
+	grep -qE '^After=.*switch-firstboot\.service' "$KU" \
+		&& ok "and after switch-firstboot, so the hostname exists before the key comment is taken from it" \
+		|| bad "switch-sshd-keygen.service is not ordered after switch-firstboot -- the key comment would race the hostname"
+	grep -qx 'ExecStart=/usr/local/sbin/switch-sshd-keygen' "$KU" \
+		&& ok "switch-sshd-keygen.service runs /usr/local/sbin/switch-sshd-keygen" || bad "switch-sshd-keygen.service ExecStart is wrong"
+	grep -qx '\[Install\]' "$KU" && grep -qx 'WantedBy=multi-user.target' "$KU" \
+		&& ok "switch-sshd-keygen.service has an [Install] section (systemctl enable needs one)" || bad "switch-sshd-keygen.service has no [Install] section"
+	head -1 "$KS" | grep -qx '#!/bin/sh' && ok "switch-sshd-keygen is /bin/sh (it must survive a swap of the base distro)" || bad "switch-sshd-keygen is not /bin/sh"
+	forbid_in "$KS" '(\[\[[[:space:]]|[[:space:]]declare[[:space:]]|^[[:space:]]*local[[:space:]]|[[:space:]]=~[[:space:]])' \
+		"the switch-sshd-keygen script uses a bashism"
+	forbid_in "$KS" '^[[:space:]]*ssh-keygen[[:space:]]+-A' \
+		"switch-sshd-keygen runs ssh-keygen -A (ed25519 only, by ruling)"
+	code_of "$KS" | grep -q 'ssh_host_\*_key' \
+		&& ok "switch-sshd-keygen post-checks that SOME host key exists (the only thing between a silent keygen failure and an unreachable switch)" \
+		|| bad "switch-sshd-keygen has no post-check -- a silent keygen failure would ship as success"
+
+	# Named as its own assertion rather than guarded around, deliberately: if
+	# ssh-keygen is missing the behavioural block below FAILS LOUDLY instead of
+	# skipping, and this row says why. It is already a floor dependency -- vm.sh
+	# mints the build key with it -- so this cannot regress quietly.
+	command -v ssh-keygen >/dev/null 2>&1 \
+		&& ok "ssh-keygen is available on this build host (the behavioural tier below runs the real script)" \
+		|| bad "no ssh-keygen on this build host -- every behavioural assertion below will fail. It is a floor dependency: vm.sh mints the build key with it."
+
+	# 🔴 RUN IT. Every assertion above is about TEXT; these are about OUTCOMES.
+	# The script is written so KEY and HOSTNAME_FILE can be redirected precisely
+	# so this tier can execute the real thing instead of describing it. Without
+	# the redirect an un-isolated run reads the BUILD HOST's /etc/hostname and
+	# passes for the wrong reason -- observed on this script's first real run,
+	# where the comment came out as the build host's name and looked plausible.
+	local KD="$W/keygen"; rm -rf "$KD"; mkdir -p "$KD/ssh"
+	printf 'mlnx-msn2410-bb2fc-0001test\n' > "$KD/hostname"
+	if KEY="$KD/ssh/ssh_host_ed25519_key" HOSTNAME_FILE="$KD/hostname" sh "$KS" >"$KD/run1.log" 2>&1; then
+		ok "switch-sshd-keygen RUNS and exits 0 with no key present"
+	else
+		bad "switch-sshd-keygen failed on a clean directory:"; sed 's/^/       /' "$KD/run1.log"
+	fi
+	[ -f "$KD/ssh/ssh_host_ed25519_key" ] && ok "and it produced an ed25519 host key" \
+		|| bad "switch-sshd-keygen exited 0 without producing a key"
+	[ "$(stat -c %a "$KD/ssh/ssh_host_ed25519_key" 2>/dev/null)" = 600 ] \
+		&& ok "the private key is mode 0600 (sshd refuses a group- or world-readable host key)" \
+		|| bad "the private key is not 0600 -- sshd will refuse it and the switch stays unreachable"
+	# 🔴 ed25519 ONLY. `ssh-keygen -A` would also leave rsa and ecdsa here, so
+	# this counts what actually landed rather than trusting the command line.
+	# ⚠ Three-way, not two. "more than one" printed on a run that produced ZERO
+	# keys during mutation testing -- a true FAIL with a false reason, which sends
+	# the next reader looking for the wrong defect.
+	local NK; NK=$(ls -1 "$KD/ssh/" 2>/dev/null | grep -c 'ssh_host_.*_key$' || true)
+	case "${NK:-0}" in
+	1) ok "exactly ONE host key type was generated (ed25519 only, by ruling)" ;;
+	0) bad "NO host key was generated at all -- the post-check should have caught this" ;;
+	*) bad "$NK host key types were generated, expected 1 (ed25519 only): $(ls -1 "$KD/ssh/" | tr '\n' ' ')" ;;
+	esac
+	# The ordering claim, proven rather than asserted: the comment IS the name.
+	ssh-keygen -l -f "$KD/ssh/ssh_host_ed25519_key.pub" 2>/dev/null | grep -q 'mlnx-msn2410-bb2fc-0001test' \
+		&& ok "the key's comment carries the DERIVED hostname (proving set_hostname-then-keygen ordering)" \
+		|| bad "the key's comment is not the derived hostname (got: $(ssh-keygen -l -f "$KD/ssh/ssh_host_ed25519_key.pub" 2>/dev/null))"
+	# Idempotence, by fingerprint. `-A` was idempotent and the replacement must
+	# be too: a re-run that regenerated the key would change the switch's
+	# identity on every boot and break every known_hosts entry in the fleet.
+	# ⚠ `|| true`, same reason as the ordering guard above: with no key present
+	# this pipeline fails and an unguarded assignment would abort the selftest
+	# instead of failing the assertion.
+	local FP1 FP2
+	FP1=$(ssh-keygen -lf "$KD/ssh/ssh_host_ed25519_key.pub" 2>/dev/null | awk '{print $2}' || true)
+	KEY="$KD/ssh/ssh_host_ed25519_key" HOSTNAME_FILE="$KD/hostname" sh "$KS" >"$KD/run2.log" 2>&1 || true
+	FP2=$(ssh-keygen -lf "$KD/ssh/ssh_host_ed25519_key.pub" 2>/dev/null | awk '{print $2}' || true)
+	[ -n "$FP1" ] && [ "$FP1" = "$FP2" ] \
+		&& ok "a second run leaves the key UNTOUCHED (same fingerprint) -- it never clobbers an operator's key" \
+		|| bad "a second run changed the host key ($FP1 -> $FP2) -- every known_hosts entry in the fleet would break"
+	grep -q 'not regenerating' "$KD/run2.log" \
+		&& ok "and it says so rather than silently doing nothing" || bad "the idempotent path is silent"
+	# 🔴 THE FAILURE PATH, exercised. A keygen that cannot run must exit NONZERO
+	# and say why: its unit failing loudly is recoverable, its unit succeeding
+	# with no key is the artifact of 2026-08-04.
+	local KB="$KD/bin"; mkdir -p "$KB" "$KD/ssh3"
+	local c p
+	for c in sh ls wc dirname tr hostname sed chmod cat; do
+		p=$(command -v "$c" 2>/dev/null) && ln -sf "$p" "$KB/$c"
+	done
+	if env -i PATH="$KB" KEY="$KD/ssh3/ssh_host_ed25519_key" HOSTNAME_FILE="$KD/hostname" \
+	   "$KB/sh" "$KS" >"$KD/run3.log" 2>&1; then
+		bad "switch-sshd-keygen exited 0 with no ssh-keygen on PATH -- a silent failure ships an unreachable switch"
+	else
+		ok "switch-sshd-keygen exits NONZERO when ssh-keygen is unavailable"
+	fi
+	grep -q 'ERROR' "$KD/run3.log" && ok "and it names the reason on stderr" || bad "the failure is silent"
+	[ -e "$KD/ssh3/ssh_host_ed25519_key" ] && bad "a failed run left a key behind" || ok "and it left no half-made key behind"
 
 	# switch-swapfile.service -- a FILE, after BOTH halves of growth.
 	grep -qx 'ConditionPathExists=!/swapfile' "$SU" \

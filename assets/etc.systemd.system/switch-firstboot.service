@@ -6,13 +6,46 @@
 # and on Arch, which is the whole reason they were chosen over
 # cloud-initramfs-growroot.
 #
-# ConditionFirstBoot=yes is true exactly when /etc/machine-id was unpopulated
-# at boot -- which is precisely the state scripts/stage-generalize.sh leaves the
-# artifact in (machine-id truncated to an empty file, per machine-id(5)). So the
-# unit fires once, on the first boot after imaging, and is SKIPPED (not failed)
-# on every boot after that. A skipped Condition* keeps `systemctl --failed`
-# clean with nothing muted, which is the project's rule: condition units, never
-# allowlist them.
+# 🔴 ConditionFirstBoot=yes WAS WRONG AND IS DELETED, 2026-08-04, after the
+# artifact's first ever boot shipped it unreachable. The old comment here
+# asserted that ConditionFirstBoot is true exactly when /etc/machine-id was
+# unpopulated at boot. IT IS NOT. It tests one thing -- whether PID 1 created
+# /run/systemd/first-boot -- and on this artifact PID 1 never did, even though
+# stage-generalize truncates machine-id exactly as machine-id(5) documents.
+# Measured in the guest:
+#
+#   DIAG first-boot-flag: ABSENT
+#   DIAG fb-ConditionResult: no
+#   systemd[1]: switch-firstboot.service ... skipped, unmet condition check
+#               ConditionFirstBoot=yes
+#
+# The boot logs "Installed transient /etc/machine-id file" and then runs
+# systemd-machine-id-commit -- the transient path, taken because / is still ro
+# at PID 1 (the kernel command line carries `ro`, and /etc becomes writable only
+# after systemd-remount-fs). Strongly indicated, deliberately NOT relied upon:
+# the replacement condition does not care why.
+#
+# 🔴 The consequence chain is why this unit is worth this much comment. No
+# first boot -> no host keys regenerated -> `sshd -t` fails -> ssh.service gives
+# up after five tries -> a switch that boots correctly in every other respect
+# and cannot be logged into.
+#
+# ConditionPathExists=!<stamp> is OWNED BY THIS PROJECT and asks a question with
+# one answer: has this script already completed successfully on this machine?
+# The script writes the stamp LAST, and only on success, so a failed run RETRIES
+# on the next boot instead of never trying again -- which ConditionFirstBoot
+# could not do, by construction. That is the same reasoning switch-swapfile.service
+# already records. A unit whose Condition fails is reported SKIPPED, not failed,
+# so `systemctl --failed` stays empty with nothing muted: the project's rule is
+# condition units, never allowlist them.
+#
+# ⚠ THE STAMP MUST BE REMOVED BEFORE EXPORT. The build guest reboots once
+# between `prepare` and `verify`, which fires this unit and writes the stamp
+# INSIDE the image being built. scripts/stage-generalize.sh's do_finish removes
+# it there, on the line below `rm -f /etc/hostname`, exactly as it already
+# removes a /swapfile a build-time reboot may have created; and
+# scripts/boot-test.sh's offline tier asserts the stamp is absent from the
+# finished artifact, so the trap cannot come back unnoticed.
 #
 # Ordering: before sshd (it regenerates the host keys sshd needs) and before
 # systemd-networkd (so DHCP does not announce the pre-generalize hostname).
@@ -48,7 +81,7 @@
 Description=Switch first-boot identity (hostname, SSH host keys, machine-id)
 Documentation=man:machine-id(5) man:ssh-keygen(1)
 DefaultDependencies=no
-ConditionFirstBoot=yes
+ConditionPathExists=!/var/lib/switch-firstboot.stamp
 After=systemd-remount-fs.service
 Before=systemd-networkd.service systemd-user-sessions.service ssh.service sshd.service
 Before=shutdown.target

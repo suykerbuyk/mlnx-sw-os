@@ -1,0 +1,54 @@
+# The switch's SSH host key -- the SECOND, INDEPENDENT trigger.
+#
+# 🔴 WHY THIS UNIT EXISTS. On 2026-08-04 the artifact booted correctly in every
+# other respect and could not be logged into. One conditioned unit --
+# switch-firstboot.service -- was the sole custodian of remote access: its
+# condition was false, nothing regenerated the SSH host keys stage-generalize
+# correctly deletes, `sshd -t` failed, and ssh.service gave up after five
+# restarts. The fix for the condition is necessary and is NOT sufficient: the
+# lesson is that host-key generation must not depend on any single unit firing.
+#
+# 🔴 CONDITIONED ON THE SYMPTOM, NOT ON A BOOT HEURISTIC. ConditionPathExists=!
+# asks the only question that matters -- "is there no host key?" -- so this
+# retries on EVERY boot that lacks one, instead of getting exactly one chance at
+# a moment systemd decides is the first boot. That is the same reasoning
+# switch-swapfile.service already records for choosing ConditionPathExists= over
+# ConditionFirstBoot=yes, and this unit is the second place it applies. A unit
+# whose Condition fails is reported SKIPPED, not failed, so `systemctl --failed`
+# stays empty with nothing muted.
+#
+# 🔴 DEBIAN'S sshd-keygen.service IS NOT USED, and this was measured on the
+# shipped artifact rather than assumed. It carries ConditionFirstBoot=yes
+# itself, so enabling it would have been skipped for exactly the same reason,
+# and its ExecStart=ssh-keygen -A mints rsa and ecdsa keys the ed25519-only
+# ruling does not want. It ships disabled and is left that way: neither enabled
+# nor masked.
+#
+# 🔴 DefaultDependencies=no IS LOAD-BEARING for the same reason it is on
+# switch-firstboot.service. Ordering Before=ssh.socket while keeping the
+# implicit After=basic.target would close a cycle -- ssh.socket is ordered
+# before sockets.target, and sockets.target is part of basic.target. systemd
+# breaks a cycle by DELETING A JOB, and which job it picks is not something this
+# project controls. After=systemd-remount-fs.service is what this actually
+# needs: /etc has to be writable, and nothing else does.
+#
+# Ordering edges naming units that do not exist on a given distro -- ssh.service
+# on Arch, sshd.service on Debian -- are inert, which is what makes one file
+# work on both.
+[Unit]
+Description=Generate the switch SSH host key if it is missing
+Documentation=man:ssh-keygen(1) man:sshd(8)
+DefaultDependencies=no
+ConditionPathExists=!/etc/ssh/ssh_host_ed25519_key
+After=systemd-remount-fs.service switch-firstboot.service
+Before=ssh.service sshd.service sshd@.service ssh.socket
+Before=shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/switch-sshd-keygen
+
+[Install]
+WantedBy=multi-user.target

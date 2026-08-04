@@ -1,0 +1,103 @@
+#!/bin/sh
+# Generate the switch's SSH host key. Installed to
+# /usr/local/sbin/switch-sshd-keygen and run from TWO independent places:
+#
+#   switch-sshd-keygen.service  ConditionPathExists=!/etc/ssh/ssh_host_ed25519_key
+#   switch-firstboot            called after set_hostname, so -C carries the name
+#
+# 🔴 THAT REDUNDANCY IS THE WHOLE POINT, and it is a ruling. The artifact
+# shipped unreachable on 2026-08-04 because ONE conditioned unit was the sole
+# custodian of remote access: switch-firstboot was skipped, nothing regenerated
+# the host keys stage-generalize correctly deletes, `sshd -t` failed, and
+# ssh.service gave up after five tries. On a switch whose only other access path
+# is a serial console, that is the difference between a remote fix and a site
+# visit.
+#
+# 🔴 DEBIAN'S OWN sshd-keygen.service CANNOT SERVE AS THAT NET, measured on the
+# shipped artifact rather than assumed:
+#
+#   /usr/lib/systemd/system/sshd-keygen.service
+#     ConditionFirstBoot=yes        <-- the SAME signal that failed
+#     ExecStart=ssh-keygen -A
+#
+# It is skipped for exactly the same reason switch-firstboot was, so enabling it
+# is inert; and `-A` mints rsa and ecdsa keys as well, which the ed25519-only
+# ruling does not want. It is left alone -- neither enabled nor masked.
+#
+# ed25519 ONLY, and that is safe here because it was checked: every HostKey
+# directive in the shipped /etc/ssh/sshd_config is commented out and
+# /etc/ssh/sshd_config.d/ is empty, so sshd falls back to its built-in list and
+# loads whichever keys exist. An explicit `HostKey /etc/ssh/ssh_host_rsa_key`
+# would have turned an ed25519-only image into a boot-time sshd failure, which
+# is the exact defect this script exists to prevent.
+#
+# POSIX sh, no bashisms -- it has to survive a swap of the base distro.
+set -eu
+
+KEY="${KEY:-/etc/ssh/ssh_host_ed25519_key}"
+# Derived, never a second hardcoded path: the post-check below has to look in
+# the same directory the key was written to, or an offline test that redirects
+# KEY would assert against the build host's own /etc/ssh and pass for the wrong
+# reason. This is what lets the selftest run this script FOR REAL.
+SSHDIR=$(dirname "$KEY")
+# Same reason as SSHDIR: overridable so the offline selftest can prove the
+# comment really does carry the DERIVED hostname. Reading the absolute
+# /etc/hostname is what is correct on a switch, and it is also what makes an
+# un-redirected test silently assert against the BUILD HOST's name -- observed
+# on this script's first real run, where the comment came out as the build
+# host's hostname and looked plausible.
+HOSTNAME_FILE="${HOSTNAME_FILE:-/etc/hostname}"
+
+log() { printf 'switch-sshd-keygen: %s\n' "$*"; }
+die() { printf 'switch-sshd-keygen: ERROR: %s\n' "$*" >&2; exit 1; }
+
+command -v ssh-keygen >/dev/null 2>&1 \
+	|| die "no ssh-keygen on this system -- the host key cannot be generated"
+
+# The comment is cosmetic, but a switch's host key that says which switch it
+# came from is worth the two lines. /etc/hostname first because switch-firstboot
+# writes it and calls this script immediately afterwards; the live hostname is
+# the fallback for the standalone unit on a machine whose /etc/hostname is
+# somehow empty. Never left blank-but-quoted: `-C ''` is a valid, useless key.
+#
+# ⚠ if/fi, not `[ -r … ] && name=…`. Both dash and bash exempt an AND-OR list
+# from errexit, so the terse form happens to be safe here -- but this project
+# has already lost a build to `[ -n "$x" ] && { … }` returning 1 as a function's
+# last statement under `set -e`, and the terse form is one edit away from being
+# that again.
+name=""
+if [ -r "$HOSTNAME_FILE" ]; then
+	name=$(tr -d ' \t\n' < "$HOSTNAME_FILE" 2>/dev/null || true)
+fi
+[ -n "$name" ] || name=$(hostname 2>/dev/null || true)
+[ -n "$name" ] || name=switch
+
+# 🔴 The guard is what makes this idempotent and non-destructive, and it is the
+# reason both callers can run unconditionally. It never clobbers a key an
+# operator installed deliberately. Generating ed25519 alongside an operator's
+# own rsa key is ADDITIVE: sshd offers both, nothing is removed.
+if [ -f "$KEY" ]; then
+	log "$KEY already exists -- not regenerating it"
+else
+	log "generating $KEY (comment '$name')"
+	ssh-keygen -q -t ed25519 -N '' -C "$name" -f "$KEY" \
+		|| die "ssh-keygen failed for $KEY"
+	chmod 0600 "$KEY"
+	[ -f "$KEY.pub" ] && chmod 0644 "$KEY.pub"
+fi
+
+# 🔴 Assert the OUTCOME, never the exit status of the tool. This post-check is
+# the only thing standing between a silent keygen failure and an unreachable
+# switch, and it is the reason the glob is *_key rather than the ed25519 name:
+# what sshd needs is A host key, so an operator's deliberately installed key
+# satisfies this just as well.
+set -- "$SSHDIR"/ssh_host_*_key
+[ -e "$1" ] || die "no SSH host key in $SSHDIR after generation -- sshd will \
+fail its ExecStartPre=/usr/sbin/sshd -t and this switch will not be reachable"
+
+log "host key(s) present: $(ls "$SSHDIR"/ssh_host_*_key 2>/dev/null | wc -l)"
+# Printed so a serial console can read the fingerprint off a switch that has
+# never been reachable, and compare it against what ssh reports on first
+# connect. Best effort: an old ssh-keygen without -l -f is not a failure.
+ssh-keygen -l -f "$KEY.pub" 2>/dev/null | sed 's/^/switch-sshd-keygen: /' || true
+log "done"

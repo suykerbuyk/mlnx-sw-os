@@ -581,6 +581,60 @@ interface.
 would assign the **same MAC to every switch** on a segment where `arrakis` holds
 ~35 permanent static ARP entries.
 
+#### 🔴 What triggers "first boot" — measured 2026-08-04, after it shipped wrong
+
+The first artifact ever produced booted correctly on **both** firmware paths and
+**could not be logged into**. `switch-firstboot.service` was enabled, its unit
+file was correct, and it never ran:
+
+```
+DIAG first-boot-flag: ABSENT          <- /run/systemd/first-boot does not exist
+DIAG fb-ConditionResult: no
+systemd[1]: switch-firstboot.service ... skipped, unmet condition check
+            ConditionFirstBoot=yes
+DIAG hostname: []     DIAG hostkeys: 0
+```
+
+**`ConditionFirstBoot=yes` does not test `/etc/machine-id`.** It tests whether
+PID 1 created `/run/systemd/first-boot`. `stage-generalize` truncates machine-id
+exactly as `machine-id(5)` documents, and the flag was still absent — the boot
+logs `Installed transient /etc/machine-id file`, the transient path taken because
+`/` is still `ro` at PID 1. Consequence chain, each link measured: no first boot
+→ no host keys → `sshd -t` fails → `ssh.service` gives up after five tries →
+hostname stays `localhost`.
+
+**Two rulings came out of it, and the second matters more than the first.**
+
+1. **The trigger is owned by this project**, not inferred from systemd's view of
+   boot generations: `ConditionPathExists=!/var/lib/switch-firstboot.stamp`. The
+   script writes the stamp **last, and only on success**, so a failed run retries
+   on the next boot — something `ConditionFirstBoot` cannot do by construction.
+   ⚠ `stage-generalize`'s `finish` **must** remove the stamp before export: the
+   build guest reboots once mid-build, which fires the unit and would otherwise
+   bake "already done" into the artifact.
+2. 🔴 **Host-key generation must not depend on any single unit firing.** A second
+   unit, `switch-sshd-keygen.service`, runs the **same** script conditioned on
+   `ConditionPathExists=!/etc/ssh/ssh_host_ed25519_key` — the actual symptom
+   rather than a boot heuristic — so it retries on every boot that lacks a key.
+   On hardware whose only other access path is a serial console, this is the
+   difference between a remote fix and a site visit.
+
+⚠ **Debian's own `sshd-keygen.service` cannot serve as that net**, read off the
+shipped artifact rather than assumed: it carries `ConditionFirstBoot=yes` itself,
+so it is skipped for exactly the same reason, and its `ExecStart=ssh-keygen -A`
+mints RSA and ECDSA keys the **ed25519-only** ruling excludes. It ships disabled
+and is left that way. ✅ ed25519-only is safe here because every `HostKey`
+directive in the shipped `sshd_config` is commented out and
+`/etc/ssh/sshd_config.d/` is empty, so sshd loads whichever keys exist.
+
+**Hostname fallback chain**: `product_serial` → **`board_serial`** → first 8 of
+`machine-id` → a literal constant. The `board_serial` rung comes from an Arch
+observation — a placeholder *product* serial alongside a valid *baseboard* one —
+and is exercised end to end, because qemu can drive both fields
+(`-smbios type=1,serial=` and `type=2,serial=`). ⚠ Never a timestamp: two
+switches imaged and booted in the same second collide on one and cannot collide
+on machine-id.
+
 ## 5. Build pipeline
 
 ```mermaid
