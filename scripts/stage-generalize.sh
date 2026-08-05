@@ -640,20 +640,62 @@ do_verify() {
 	# 🔴 THE CONDITION ACTUALLY EVALUATED, in the guest, by systemd itself --
 	# not the file's text. This is the assertion that would have caught the
 	# original defect: ConditionFirstBoot=yes read correct and evaluated false.
-	# In the build guest the stamp EXISTS (the post-prepare reboot ran the unit),
-	# so the expected result here is "no". What matters is that systemd answers
-	# at all and that the answer tracks the stamp.
-	# ⚠ `|| true` is NOT decoration. An unguarded `x=$(cmd)` aborts the whole
-	# payload under `set -e` with no message -- the iter-13 defect that hid a
-	# broken installer for three sessions.
-	CR=$(systemctl show -p ConditionResult --value switch-firstboot.service 2>/dev/null || true)
-	if [ -e /var/lib/switch-firstboot.stamp ]; then
-		[ "$CR" = no ] && ok "switch-firstboot's condition tracks the stamp (stamp present -> ConditionResult=$CR)" \
-			|| bad "the stamp exists but switch-firstboot's ConditionResult is '$CR' -- the condition is not reading the stamp"
-		note "/var/lib/switch-firstboot.stamp exists in the guest (the post-prepare reboot ran the unit); finish removes it"
+	#
+	# 🔴 IT IS EVALUATED NOW, NOT READ OFF THE LAST BOOT. `systemctl show -p
+	# ConditionResult` reports the condition as evaluated when the unit was
+	# STARTED, and switch-firstboot writes the stamp DURING that start -- so on
+	# the build guest's post-prepare boot the honest answer is always "yes":
+	#
+	#     boot                15:05:15
+	#     ConditionTimestamp  15:05:17       <- evaluated here, stamp absent
+	#     stamp written       15:05:17.712   <- by the unit, after that
+	#
+	# The previous version of this check compared the stamp's state NOW against
+	# that boot-time snapshot and demanded "no", so it could only pass after a
+	# SECOND reboot -- which the proven sequence does not have. It failed
+	# against a perfectly correct unit (measured 2026-08-05). Two different
+	# moments were being compared as if they were one.
+	#
+	# `systemd-analyze condition` evaluates a directive against the CURRENT
+	# state, which is the question actually being asked.
+	#
+	# ⚠ The directive is read out of the SHIPPED unit, never hardcoded here: a
+	# literal would keep passing after someone changed the unit's condition,
+	# which is exactly the class of check this file exists to avoid.
+	#
+	# ⚠ `|| true` / explicit rc capture is NOT decoration. `systemd-analyze
+	# condition` exits NON-ZERO when the condition fails, which is a normal
+	# answer here -- an unguarded `x=$(cmd)` aborts the whole payload under
+	# `set -e` with no message. That is the iter-13 defect that hid a broken
+	# installer for three sessions, and it bit again while writing this.
+	FB_UNIT=/etc/systemd/system/switch-firstboot.service
+	FB_COND=$(grep -m1 '^ConditionPathExists=' "$FB_UNIT" 2>/dev/null || true)
+	if [ -z "$FB_COND" ]; then
+		bad "switch-firstboot.service carries no ConditionPathExists= directive -- it would run on EVERY boot"
+	elif ! command -v systemd-analyze >/dev/null 2>&1; then
+		note "systemd-analyze absent: cannot evaluate the condition against current state"
 	else
-		[ "$CR" = yes ] && ok "switch-firstboot's condition tracks the stamp (no stamp -> ConditionResult=$CR)" \
-			|| bad "no stamp exists but switch-firstboot's ConditionResult is '$CR'"
+		FB_RC=0; systemd-analyze condition "$FB_COND" >/dev/null 2>&1 || FB_RC=$?
+		# 🔴 POSITIVE CONTROL. Same directive shape, a path that cannot exist.
+		# Without it, an instrument that always reported "failed" would make
+		# the stamp-present branch below pass for the wrong reason.
+		CTL_RC=0; systemd-analyze condition "ConditionPathExists=!/var/lib/switch-firstboot.stamp.absent.$$" >/dev/null 2>&1 || CTL_RC=$?
+		if [ "$CTL_RC" = 0 ]; then
+			ok "systemd-analyze evaluates this directive shape and SUCCEEDS on an absent path (the instrument discriminates)"
+		else
+			bad "the positive control FAILED (rc=$CTL_RC) -- systemd-analyze rejects the directive shape, so the verdict below means nothing"
+		fi
+		if [ -e /var/lib/switch-firstboot.stamp ]; then
+			[ "$FB_RC" != 0 ] \
+				&& ok "the SHIPPED condition, evaluated now, would SKIP the unit (stamp present) -- systemd is reading the stamp" \
+				|| bad "the stamp exists but the shipped condition still evaluates true -- the unit would re-run identity on every boot"
+			note "/var/lib/switch-firstboot.stamp exists in the guest (the post-prepare reboot ran the unit); finish removes it"
+			note "systemctl ConditionResult is '$(systemctl show -p ConditionResult --value switch-firstboot.service 2>/dev/null || true)' -- the BOOT-TIME evaluation, before the unit wrote the stamp; not a defect"
+		else
+			[ "$FB_RC" = 0 ] \
+				&& ok "the SHIPPED condition, evaluated now, would RUN the unit (no stamp) -- first boot is armed" \
+				|| bad "no stamp exists but the shipped condition evaluates false -- first boot would be SKIPPED and the switch ships with no identity"
+		fi
 	fi
 	# The old mechanism must be gone from the unit as SHIPPED IN THE GUEST, not
 	# merely from the asset in the repo.
