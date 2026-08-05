@@ -60,8 +60,71 @@ debian)
 	#   generic       cloud-init present, full driver set, and Debian
 	#                 explicitly lists bare metal as a target. The only
 	#                 variant that satisfies both halves of this pipeline.
-	BASE_URL="https://cloud.debian.org/images/cloud/trixie/latest"
-	BASE_IMAGE="debian-13-generic-amd64.qcow2"
+	#
+	# 🔴 PINNED TO AN IMMUTABLE SNAPSHOT, NEVER `latest/`. `latest/` is a
+	# MOVING TARGET and pointing a build at it has two distinct failure
+	# modes, both measured on this host 2026-08-04:
+	#
+	#   1. The image is cached and the SUMS file is not, so a re-fetch
+	#      verifies a GOOD cache against a NEWER snapshot's checksum and
+	#      dies with "CHECKSUM MISMATCH" -- telling the operator to delete
+	#      the only pinned thing in the build. Reproduced exactly: the
+	#      cache held 1ff07be8… (snapshot 20260722-2547) under a SUMS file
+	#      saying db3cd133… (snapshot 20260803-2559).
+	#
+	#   2. Worse, and silent: `curl -C -` resumes by BYTE OFFSET. Against a
+	#      URL whose content changed underneath it, a local file SMALLER
+	#      than the new remote yields a HYBRID -- old bytes at the front,
+	#      new bytes at the back, the correct total size, and curl exits 0.
+	#      A local file LARGER is left stale and never refreshed, also rc=0.
+	#      Only the checksum catches either, and case 1 is why the checksum
+	#      cannot be trusted. Pinning makes `-C -` correct again, which is
+	#      why the flag is KEPT: resuming 400 MB is what it is for.
+	#
+	# Bump these deliberately, in a commit that says why -- it is a FLOOR to
+	# be raised on purpose, exactly like the `linux-headers-amd64` bound.
+	# Two builds must differ in the code under test, not in their base.
+	#
+	# 🔴 THESE TWO ARE ONE FACT AND MOVE TOGETHER. The digest describes THAT
+	# serial's image and no other, which is why it is keyed to the serial
+	# below rather than applied to whatever serial happens to be selected:
+	# carrying yesterday's digest onto today's snapshot reports a perfectly
+	# good download as corrupt, which is the exact false diagnosis this
+	# whole change exists to remove.
+	#
+	# 🔴 The expected digest is a REPO FACT, not a network fact. An immutable
+	# directory is still fetched over the network, and verifying a download
+	# against a checksum from the same server only proves the server is
+	# self-consistent. The mirror's own SUMS is then a corroborating second
+	# opinion, and the two disagreeing is a finding rather than a coin toss.
+	PINNED_SERIAL=20260722-2547
+	PINNED_SHA512=1ff07be8406c4abcb75662a351b6124408c4a2795801037f8e4fe9ee27084ee2112bef92222f4bbeb9f7df8df1062971a9692f4c82f3da3c01fda6b1493906b9
+
+	BASE_SERIAL="${BASE_SERIAL:-$PINNED_SERIAL}"
+
+	# ⚠ Snapshot directories and `latest/` DO NOT USE THE SAME FILENAMES:
+	#     latest/         debian-13-generic-amd64.qcow2
+	#     20260722-2547/  debian-13-generic-amd64-20260722-2547.qcow2
+	# so a pin is not a URL swap -- the filename is serial-stamped too.
+	if [ "$BASE_SERIAL" = latest ]; then
+		BASE_URL="https://cloud.debian.org/images/cloud/trixie/latest"
+		BASE_IMAGE="debian-13-generic-amd64.qcow2"
+		# No repo-side digest is possible for a moving target.
+		BASE_SHA512="${BASE_SHA512-}"
+	else
+		BASE_URL="https://cloud.debian.org/images/cloud/trixie/$BASE_SERIAL"
+		BASE_IMAGE="debian-13-generic-amd64-$BASE_SERIAL.qcow2"
+		if [ "$BASE_SERIAL" = "$PINNED_SERIAL" ]; then
+			BASE_SHA512="${BASE_SHA512-$PINNED_SHA512}"
+		else
+			# THE BUMP PATH. A serial other than the recorded one has no
+			# recorded digest yet -- by definition, that is what bumping
+			# means. Verify against the mirror, and do_fetch prints the
+			# observed digest for the human to record. Anything else here
+			# would mean checking a new image against an old digest.
+			BASE_SHA512="${BASE_SHA512-}"
+		fi
+	fi
 	SUMS_FILE="SHA512SUMS"
 	SUMS_TOOL="sha512sum"
 	;;
@@ -69,8 +132,19 @@ arch)
 	# URLs confirmed to resolve 2026-08-01. The provision() package commands
 	# have NOT been exercised on Arch -- this entry demonstrates that the
 	# seam is real, it does not claim a supported path.
+	#
+	# ⚠ THIS ARM IS NOT PINNED, and that is a known gap rather than a
+	# ruling. `images/latest` is the same moving-target shape the debian
+	# arm was just pinned away from, so it carries the same two defects
+	# documented above. It is left as-is because this seam has never been
+	# exercised and pinning a serial nobody has ever built from would be
+	# inventing a fact. The MECHANISM below (repo digest first, mirror as
+	# corroboration, unpinned builds warn) applies to this arm already --
+	# only the pinned serial is missing.
+	BASE_SERIAL="${BASE_SERIAL:-latest}"
 	BASE_URL="https://geo.mirror.pkgbuild.com/images/latest"
 	BASE_IMAGE="Arch-Linux-x86_64-cloudimg.qcow2"
+	BASE_SHA512="${BASE_SHA512:-}"
 	SUMS_FILE="Arch-Linux-x86_64-cloudimg.qcow2.SHA256"
 	SUMS_TOOL="sha256sum"
 	;;
@@ -79,6 +153,16 @@ arch)
 esac
 
 CACHE="$WORK/cache"                 # pristine downloads -- NEVER mutated
+
+# 🔴 The sums file is cached UNDER THE NAME OF THE IMAGE IT DESCRIBES, never
+# under its own remote name. Every snapshot serves a file called `SHA512SUMS`,
+# so caching it by that name aliases every serial onto one path -- which is
+# precisely the mechanism that let a 20260722 image sit under a 20260803 sums
+# file and report a good cache as corrupt. Named this way, a sums file can only
+# ever sit beside the image it is about, and a stale pair is visible in `ls`
+# rather than inferred. BASE_IMAGE is serial-stamped, so two serials cannot
+# collide in either file.
+SUMS_CACHE="$CACHE/$BASE_IMAGE.sums"
 IMG="$WORK/work.qcow2"
 SEED="$WORK/seed.iso"
 KEY="$WORK/id_ed25519"
@@ -192,19 +276,97 @@ do_fetch() {
 	need curl
 	mkdir -p "$CACHE"
 
+	# ⚠ Three distinct states, and each message says only what it can know.
+	# "pinned" and "has a repo digest" are SEPARATE properties: keying the
+	# moving-target warning off the digest would report a pinned serial with
+	# an empty BASE_SHA512 as a moving target, which is simply false.
+	if [ "$BASE_SERIAL" = latest ]; then
+		# Loud, on every unpinned fetch. The whole point of the pin is that
+		# "which base image was this built from?" has an answer; an unpinned
+		# build must not be able to look like a pinned one.
+		info "⚠ BASE_SERIAL=latest is a MOVING TARGET -- this build is NOT reproducible"
+		info "⚠ no repo-side digest is possible for it; the mirror's $SUMS_FILE is the only authority"
+	elif [ -z "$BASE_SHA512" ]; then
+		info "base image pinned to snapshot $BASE_SERIAL (reproducible)"
+		info "⚠ no digest is recorded in this repo for $BASE_SERIAL -- the mirror is the only authority"
+	else
+		info "base image pinned to snapshot $BASE_SERIAL"
+	fi
+
 	info "fetching $BASE_IMAGE"
 	# -L: cloud.debian.org 302s to a mirror. -C -: resume a partial download
-	# rather than restarting 388 MB.
+	# rather than restarting 400 MB. ⚠ Sound ONLY because the URL is pinned:
+	# resuming by byte offset against a moving target silently splices two
+	# different images together. See the DISTRO case block.
 	curl -fL --progress-bar -C - -o "$CACHE/$BASE_IMAGE" "$BASE_URL/$BASE_IMAGE"
-	curl -fLsS -o "$CACHE/$SUMS_FILE" "$BASE_URL/$SUMS_FILE"
+	curl -fLsS -o "$SUMS_CACHE" "$BASE_URL/$SUMS_FILE"
 
 	info "verifying checksum"
-	local line
-	line=$(grep -F " $BASE_IMAGE" "$CACHE/$SUMS_FILE" | head -1) \
-		|| die "$BASE_IMAGE is not listed in $SUMS_FILE -- cannot verify"
-	[ -n "$line" ] || die "$BASE_IMAGE is not listed in $SUMS_FILE"
-	( cd "$CACHE" && printf '%s\n' "$line" | "$SUMS_TOOL" -c - ) \
-		|| die "CHECKSUM MISMATCH -- delete $CACHE/$BASE_IMAGE and refetch"
+	local have line mirror
+	have="$("$SUMS_TOOL" "$CACHE/$BASE_IMAGE" | cut -d' ' -f1)"
+
+	# Exact field match, never a substring: one snapshot directory lists
+	# .json, .qcow2, .raw and .tar.xz sharing a prefix, and `grep -F` on a
+	# name that is a prefix of another would take whichever sorted first.
+	line=$(awk -v n="$BASE_IMAGE" '$2 == n || $2 == "*" n { print; exit }' "$SUMS_CACHE")
+	mirror=$(printf '%s\n' "$line" | cut -d' ' -f1)
+
+	if [ -n "$BASE_SHA512" ]; then
+		# The REPO's digest is the authority. The mirror gets a vote, not a veto.
+		if [ "$have" != "$BASE_SHA512" ]; then
+			printf 'error: CHECKSUM MISMATCH against the digest pinned in this repo\n' >&2
+			printf '       expected: %s\n' "$BASE_SHA512" >&2
+			printf '       got:      %s\n' "$have" >&2
+			# The URL is immutable, so "the remote moved" is ruled OUT by
+			# construction and only one cause remains. Say which.
+			printf '       %s is an IMMUTABLE snapshot, so the remote cannot have moved:\n' "$BASE_SERIAL" >&2
+			printf '       this is a corrupt or partial download. Delete it and refetch:\n' >&2
+			printf '         rm -f %s %s\n' "$CACHE/$BASE_IMAGE" "$SUMS_CACHE" >&2
+			exit 1
+		fi
+		info "matches the digest pinned in this repo"
+
+		if [ -z "$line" ]; then
+			info "⚠ $BASE_IMAGE is not listed in the mirror's $SUMS_FILE -- no second opinion available"
+		elif [ "$mirror" = "$BASE_SHA512" ]; then
+			info "and the mirror's $SUMS_FILE agrees"
+		else
+			# Not a download problem: the bytes already matched the repo.
+			# Either the recorded digest is wrong for this serial, or the
+			# mirror is serving something else. Both need a human.
+			printf 'error: the mirror DISAGREES with the digest pinned in this repo\n' >&2
+			printf '       repo:   %s\n' "$BASE_SHA512" >&2
+			printf '       mirror: %s\n' "$mirror" >&2
+			printf '       The downloaded bytes match the repo, so this is NOT a corrupt\n' >&2
+			printf '       download -- do not "delete and refetch". Either BASE_SHA512 is\n' >&2
+			printf '       recorded wrong for %s, or the mirror is serving another image.\n' "$BASE_SERIAL" >&2
+			exit 1
+		fi
+	else
+		# Unpinned: the mirror is all there is.
+		[ -n "$line" ] || die "$BASE_IMAGE is not listed in $SUMS_FILE -- cannot verify"
+		if [ "$have" != "$mirror" ]; then
+			printf 'error: CHECKSUM MISMATCH against the mirror'"'"'s %s\n' "$SUMS_FILE" >&2
+			printf '       expected: %s\n' "$mirror" >&2
+			printf '       got:      %s\n' "$have" >&2
+			printf '       ⚠ BASE_SERIAL=%s is a MOVING TARGET, so there are TWO causes and\n' "$BASE_SERIAL" >&2
+			printf '       this message cannot tell them apart: a corrupt download, OR a\n' >&2
+			printf '       perfectly good cache measured against a newer snapshot.\n' >&2
+			printf '       Pin BASE_SERIAL to a snapshot and the ambiguity goes away.\n' >&2
+			exit 1
+		fi
+		if [ "$BASE_SERIAL" = latest ]; then
+			info "matches the mirror's $SUMS_FILE (unpinned -- this is not a reproducibility claim)"
+		else
+			# THE BUMP PATH's payoff: hand the human the exact two lines to
+			# paste, so recording a new pin is copy-paste rather than a
+			# manual sha512sum they might run against the wrong file.
+			info "matches the mirror's $SUMS_FILE"
+			info "to make this pin permanent, record BOTH lines in the debian arm of vm.sh:"
+			printf '         PINNED_SERIAL=%s\n' "$BASE_SERIAL"
+			printf '         PINNED_SHA512=%s\n' "$have"
+		fi
+	fi
 
 	info "base image verified: $CACHE/$BASE_IMAGE"
 }
@@ -654,9 +816,22 @@ write_selftest_shims() { # $1 = bin dir
 	curl)
 		o=$(argval -o "$@") || o=
 		case "$o" in
-		"")          ;;
-		*SUMS|*SHA*) printf '%s  %s\n' "${SHIM_SUM:-000bad000}" "${SHIM_SUM_NAME:-debian-13-generic-amd64.qcow2}" > "$o" ;;
-		*)           printf 'FAKE-BASE-IMAGE\n' > "$o" ;;
+		"") ;;
+		*.sums|*SUMS|*SHA*)
+			# The name written into the sums line is DERIVED from the
+			# -o path (strip the .sums suffix the caller appended), so
+			# the shim tracks whatever BASE_IMAGE the child computed
+			# instead of hardcoding one serial's filename and going
+			# stale the next time the pin moves. SHIM_SUM_NAME still
+			# overrides, for the "not listed at all" case.
+			#
+			# ⚠ NOT `n`: that is this shim's sequence counter, set
+			# above and used for argv.$n/stdin.$n. Reusing it here
+			# happens to work only because those writes already
+			# ran -- which is a trap, not a design.
+			sn="${o##*/}"; sn="${sn%.sums}"
+			printf '%s  %s\n' "${SHIM_SUM:-000bad000}" "${SHIM_SUM_NAME:-$sn}" > "$o" ;;
+		*)  printf 'FAKE-BASE-IMAGE\n' > "$o" ;;
 		esac ;;
 	esac
 	exit 0
@@ -783,8 +958,12 @@ do_selftest() {
 	# Clear the stand-in the port checks needed, or up would short-circuit on it
 	# and this section would assert against a qemu that was never launched.
 	guest_stop
-	printf 'PRISTINE-BASE\n' > "$FAKE_WORK/cache/debian-13-generic-amd64.qcow2"
-	real_sum="$(sha512sum "$FAKE_WORK/cache/debian-13-generic-amd64.qcow2" | cut -d' ' -f1)"
+	# $BASE_IMAGE, never a literal: it is serial-stamped now, so a hardcoded
+	# filename here would silently stop describing the file the child looks
+	# for the next time the pin moves -- and `up` would fail for a reason
+	# that has nothing to do with what this section is testing.
+	printf 'PRISTINE-BASE\n' > "$FAKE_WORK/cache/$BASE_IMAGE"
+	real_sum="$(sha512sum "$FAKE_WORK/cache/$BASE_IMAGE" | cut -d' ' -f1)"
 	run_cmd up
 	# Keep THIS run's ledger: run_cmd clears it, and the seed assertions two
 	# sections down are about the boot-from-scratch run, not about whatever ran
@@ -804,7 +983,7 @@ do_selftest() {
 	grep -q -- '-pidfile' "$SHIM_DIR/ledger" \
 		&& ok "qemu is given a pidfile (liveness is read from it, never from a process name)" \
 		|| bad "qemu is given no pidfile"
-	[ "$(sha512sum "$FAKE_WORK/cache/debian-13-generic-amd64.qcow2" | cut -d' ' -f1)" = "$real_sum" ] \
+	[ "$(sha512sum "$FAKE_WORK/cache/$BASE_IMAGE" | cut -d' ' -f1)" = "$real_sum" ] \
 		&& ok "the pristine base is byte-identical after up (copied, never mutated)" \
 		|| bad "up MUTATED the pristine base -- a re-run no longer starts from a known state"
 	[ -f "$FAKE_WORK/work.qcow2" ] && ok "the working image is a separate file" \
@@ -900,19 +1079,184 @@ do_selftest() {
 		|| bad "status claimed a monitor that is not there"
 
 	hdr "13 fetch verifies the checksum -- and REJECTS a bad one"
+	# The digest of what the curl stand-in actually writes. Every pinned case
+	# below hands this as BASE_SHA512, so "the repo digest matches the bytes"
+	# is a real comparison of real bytes and not a tautology between two
+	# copies of the same constant.
+	local good_sum
+	good_sum="$(printf 'FAKE-BASE-IMAGE\n' | sha512sum | cut -d' ' -f1)"
+
 	rm -rf "$FAKE_WORK/cache"
 	run_cmd fetch
 	[ "$CMD_RC" != 0 ] && ok "a checksum mismatch aborts the fetch (rc=$CMD_RC)" \
 	                   || bad "fetch ACCEPTED an image whose checksum did not match"
 	said "CHECKSUM MISMATCH" && ok "and it says so" || bad "the mismatch is not reported"
 	rm -rf "$FAKE_WORK/cache"
-	run_cmd fetch SHIM_SUM="$(printf 'FAKE-BASE-IMAGE\n' | sha512sum | cut -d' ' -f1)"
+	run_cmd fetch SHIM_SUM="$good_sum" BASE_SHA512="$good_sum"
 	[ "$CMD_RC" = 0 ] && ok "a matching checksum is accepted (both polarities -- a verifier that never passes is also broken)" \
 	                  || bad "fetch rejected an image whose checksum DID match: rc=$CMD_RC"
 
+	hdr "13a the base image is PINNED to an immutable snapshot, not latest/"
+	# 🔴 The regression that motivated all of this: a build whose base image
+	# is whatever the mirror served today cannot be compared to yesterday's.
+	grep -qE '^[[:space:]]*PINNED_SERIAL=[0-9]{8}-[0-9]+$' "$SELF_PATH" \
+		&& ok "the debian arm records a dated snapshot serial, not 'latest'" \
+		|| bad "the debian arm records no pinned snapshot serial"
+	guard_fires '^[[:space:]]*PINNED_SERIAL=[0-9]{8}-[0-9]+$' \
+		'	PINNED_SERIAL=20260722-2547' "pinned-serial"
+	grep -qE '^[[:space:]]*BASE_SERIAL="\$\{BASE_SERIAL:-\$PINNED_SERIAL\}"' "$SELF_PATH" \
+		&& ok "and the default BASE_SERIAL is that recorded pin, not a second literal" \
+		|| bad "BASE_SERIAL does not default to PINNED_SERIAL -- two places to keep in sync"
+	rm -rf "$FAKE_WORK/cache"
+	run_cmd fetch SHIM_SUM="$good_sum" BASE_SHA512="$good_sum"
+	grep -q "cloud/trixie/[0-9]\{8\}-[0-9]*/" "$SHIM_DIR/ledger" \
+		&& ok "the fetch URL names the snapshot directory, so the remote cannot move under it" \
+		|| bad "the fetch URL still points at a moving directory"
+	grep -q "cloud/trixie/latest/" "$SHIM_DIR/ledger" \
+		&& bad "a default fetch still requested latest/ -- the pin is not wired to the URL" \
+		|| ok "no default fetch requests latest/"
+	# ⚠ Snapshot dirs serve serial-STAMPED filenames; latest/ does not. A pin
+	# that changed only the URL would 404 on every fetch.
+	grep -qE "debian-13-generic-amd64-[0-9]{8}-[0-9]+\.qcow2" "$SHIM_DIR/ledger" \
+		&& ok "and it requests the serial-stamped filename the snapshot actually serves" \
+		|| bad "the pinned URL requests an unstamped filename that only latest/ serves"
+
+	hdr "13b two serials cannot alias onto one cache entry"
+	# This aliasing IS the defect: one image sitting under another snapshot's
+	# sums file is what reported a good cache as corrupt.
+	# Measured by running the real config twice, never by comparing two
+	# literals: a literal comparison would still pass if the code stopped
+	# using the serial at all.
+	local sums_a sums_b
+	rm -rf "$FAKE_WORK/cache"
+	run_cmd fetch SHIM_SUM="$good_sum" BASE_SHA512="$good_sum" BASE_SERIAL=20260722-2547
+	sums_a="$(ls "$FAKE_WORK/cache/" | grep '\.sums$' || true)"
+	run_cmd fetch SHIM_SUM="$good_sum" BASE_SHA512="$good_sum" BASE_SERIAL=20260803-2559
+	sums_b="$(ls "$FAKE_WORK/cache/" | grep '\.sums$' | grep -v "^$sums_a$" || true)"
+	[ -n "$sums_a" ] && [ -n "$sums_b" ] \
+		&& ok "each serial caches its sums file beside its OWN image ($sums_a, $sums_b)" \
+		|| bad "the two serials shared one sums cache path -- the aliasing bug is back"
+	[ "$(ls "$FAKE_WORK/cache/" | grep -c '\.qcow2$')" -ge 2 ] \
+		&& ok "and both images coexist, so a stale pair is visible in ls rather than inferred" \
+		|| bad "the second serial overwrote the first image in the cache"
+
+	hdr "13c a moved MIRROR is not reported as a corrupt download"
+	# 🔴 The exact false diagnosis this task exists to kill. The bytes are
+	# fine and match the repo; only the mirror's sums moved. Telling the
+	# operator to "delete and refetch" here destroys a good 400 MB cache.
+	rm -rf "$FAKE_WORK/cache"
+	run_cmd fetch BASE_SHA512="$good_sum" SHIM_SUM=00deadbeef00
+	[ "$CMD_RC" != 0 ] && ok "a mirror that disagrees with the pinned digest is still an ERROR (rc=$CMD_RC)" \
+	                   || bad "a mirror disagreeing with the repo digest was accepted silently"
+	said "mirror DISAGREES" \
+		&& ok "and it is reported as a mirror disagreement, naming both digests" \
+		|| bad "the mirror disagreement is not named as such"
+	said "NOT a corrupt" \
+		&& ok "🔴 and it explicitly says this is NOT a corrupt download" \
+		|| bad "🔴 a moved mirror is still diagnosed as a corrupt download -- the false diagnosis is back"
+	# ⚠ Assert on the destructive ADVICE, not on the phrase: the mirror
+	# message contains the words "delete and refetch" inside a `do not`
+	# clause, so grepping the phrase makes this guard match its own message
+	# and fail on correct output. It did exactly that on first run. The
+	# corrupt-download path is the only one that emits an `rm -f` command.
+	said "rm -f" \
+		&& bad "it still hands the operator an rm -f for a cache whose bytes match the repo" \
+		|| ok "it hands out no rm -f for a good cache (the advice, not the phrase)"
+
+	hdr "13d the repo digest is the authority, and a corrupt download says so"
+	rm -rf "$FAKE_WORK/cache"
+	run_cmd fetch BASE_SHA512=00notthebytes00 SHIM_SUM=00notthebytes00
+	[ "$CMD_RC" != 0 ] && ok "bytes that match NEITHER are rejected (rc=$CMD_RC)" \
+	                   || bad "fetch accepted bytes matching neither digest"
+	said "pinned in this repo" \
+		&& ok "the repo digest is named as the thing that failed" \
+		|| bad "the failure does not say which authority rejected it"
+	said "IMMUTABLE snapshot" \
+		&& ok "and it rules OUT 'the remote moved' by construction, leaving one cause" \
+		|| ok "the immutability argument is not spelled out (message wording only)"
+	# 🔴 Positive control for the whole 13c/13d pair: with the SAME shim
+	# bytes, only the digests differing, the good case must still pass. Two
+	# rejections in a row could otherwise both be a fetch that never ran.
+	rm -rf "$FAKE_WORK/cache"
+	run_cmd fetch BASE_SHA512="$good_sum" SHIM_SUM="$good_sum"
+	[ "$CMD_RC" = 0 ] \
+		&& ok "positive control: identical bytes with correct digests still pass" \
+		|| bad "positive control FAILED -- 13c/13d may be rejecting for an unrelated reason"
+	said "mirror" && said "agrees" \
+		&& ok "and the mirror is reported as a corroborating second opinion" \
+		|| ok "the agreement line is not printed (message wording only)"
+
+	hdr "13e an UNPINNED build is accepted, but says it is not reproducible"
+	# latest/ stays reachable on purpose -- for bumping the pin. What must
+	# never happen is an unpinned build looking like a pinned one.
+	rm -rf "$FAKE_WORK/cache"
+	run_cmd fetch BASE_SERIAL=latest SHIM_SUM="$good_sum"
+	[ "$CMD_RC" = 0 ] && ok "BASE_SERIAL=latest still works (it is how the pin gets bumped)" \
+	                  || bad "BASE_SERIAL=latest is broken: rc=$CMD_RC"
+	said "NOT reproducible" \
+		&& ok "🔴 and every unpinned fetch says so, so it cannot pass for a pinned one" \
+		|| bad "🔴 an unpinned fetch is silent -- it is indistinguishable from a pinned build"
+	grep -q "cloud/trixie/latest/" "$SHIM_DIR/ledger" \
+		&& ok "and it genuinely requested latest/ (the override reaches the URL)" \
+		|| bad "BASE_SERIAL=latest did not actually change the URL"
+	rm -rf "$FAKE_WORK/cache"
+	run_cmd fetch BASE_SERIAL=latest SHIM_SUM=00wrong00
+	[ "$CMD_RC" != 0 ] && ok "an unpinned mismatch still fails closed" \
+	                   || bad "an unpinned build accepted a mismatched image"
+	said "TWO causes" \
+		&& ok "and it admits it cannot tell a bad download from a moved snapshot" \
+		|| bad "an unpinned mismatch still claims a single cause it cannot know"
+
+	hdr "13f BUMPING the pin -- a new serial is not checked against the old digest"
+	# 🔴 The defect this section exists for was introduced by the FIX and
+	# caught before commit: with `${BASE_SHA512:-$PINNED_SHA512}` applied to
+	# every serial, pointing at a NEW snapshot verified a new image against
+	# the previous one's digest and reported a perfectly good download as
+	# corrupt -- the same false diagnosis the whole change removes, moved one
+	# step downstream. The serial and its digest are ONE fact.
+	rm -rf "$FAKE_WORK/cache"
+	run_cmd fetch BASE_SERIAL=20260803-2559 SHIM_SUM="$good_sum"
+	[ "$CMD_RC" = 0 ] \
+		&& ok "🔴 a serial with no recorded digest verifies against the MIRROR and succeeds" \
+		|| bad "🔴 bumping the pin failed -- the new image was checked against the old digest"
+	said "no digest is recorded in this repo" \
+		&& ok "and it says why the mirror is the authority for this run" \
+		|| bad "the missing-digest state is silent"
+	said "NOT reproducible" \
+		&& bad "a pinned-but-unrecorded serial is wrongly called a moving target" \
+		|| ok "a pinned serial is NOT called a moving target (pinned and recorded are separate properties)"
+	said "PINNED_SHA512=$good_sum" \
+		&& ok "and it prints the exact line to record, so bumping is copy-paste" \
+		|| bad "the bump path does not hand back the digest it just measured"
+	# Positive control: the RECORDED serial must still use the repo digest,
+	# or the branch above would just be "the digest is never used".
+	# ⚠ The shim's bytes never match PINNED_SHA512, so the RECORDED serial
+	# rejects them via the repo-digest branch -- which is the point: the same
+	# invocation that succeeds on an unrecorded serial must fail on the
+	# recorded one, and say the REPO rejected it. Written as if/else rather
+	# than an && || chain, which silently reports the wrong arm when the
+	# middle test fails.
+	rm -rf "$FAKE_WORK/cache"
+	run_cmd fetch SHIM_SUM="$good_sum"
+	if [ "$CMD_RC" != 0 ] && said "pinned in this repo"; then
+		ok "positive control: the RECORDED serial applies the repo digest and rejects other bytes"
+	else
+		bad "positive control FAILED -- the recorded digest is not being applied at all (rc=$CMD_RC)"
+	fi
+
 	hdr "14 destroy keeps the pristine base"
+	# 🔴 Re-establish the precondition rather than inheriting it. Section 13e
+	# leaves the cache holding a `latest`-named image, so this section's
+	# assertion about $BASE_IMAGE (serial-stamped) would fail for a reason
+	# that has nothing to do with destroy -- an assertion measuring the
+	# previous section instead of the code under test. It did exactly that on
+	# first run. A pinned fetch here makes the section order-independent.
+	rm -rf "$FAKE_WORK/cache"
+	run_cmd fetch SHIM_SUM="$good_sum" BASE_SHA512="$good_sum"
+	[ -r "$FAKE_WORK/cache/$BASE_IMAGE" ] \
+		|| bad "precondition failed: the pinned base is not in the cache before destroy"
 	run_cmd destroy
-	[ -r "$FAKE_WORK/cache/debian-13-generic-amd64.qcow2" ] \
+	[ -r "$FAKE_WORK/cache/$BASE_IMAGE" ] \
 		&& ok "destroy keeps \$CACHE (the base is expensive and is never mutated)" \
 		|| bad "destroy deleted the pristine base"
 	[ -f "$FAKE_WORK/work.qcow2" ] && bad "destroy left the working image behind" \
