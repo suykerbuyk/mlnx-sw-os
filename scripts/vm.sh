@@ -1283,6 +1283,15 @@ do_selftest() {
 mkdir -p "$WORK"
 case "${1:-}" in
 fetch)     do_fetch ;;
+# The resolved base-image path, on stdout, alone -- so another script can ask
+# rather than rebuild the name. boot-test.sh used to hardcode
+# `cache/debian-13-generic-amd64.qcow2`; when the base was pinned to a snapshot
+# the filename became serial-stamped and that literal broke, with an error
+# telling the operator to run `vm.sh fetch` -- which no longer creates the file
+# it named. A name derived in two places disagrees the moment one of them moves.
+base-image)
+	[ -r "$CACHE/$BASE_IMAGE" ] || die "no base image at $CACHE/$BASE_IMAGE -- run: $0 fetch"
+	printf '%s\n' "$CACHE/$BASE_IMAGE" ;;
 up)        do_up ;;
 ssh)       shift; ssh_vm "$@" ;;
 provision) do_provision ;;
@@ -1294,6 +1303,6 @@ destroy)   do_destroy ;;
 selftest)  do_selftest ;;
 *)
 	sed -n '2,18p' "$0" | sed 's/^# \?//'
-	printf '\nUsage: %s {fetch|up|ssh|provision|probe|audit|status|down|destroy|selftest}\n' "$0"
+	printf '\nUsage: %s {fetch|base-image|up|ssh|provision|probe|audit|status|down|destroy|selftest}\n' "$0"
 	exit 1 ;;
 esac

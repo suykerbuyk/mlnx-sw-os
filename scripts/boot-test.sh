@@ -72,7 +72,15 @@ WORK="${WORK:-/var/tmp/mlnx-sw-os-boot-test}"
 VM_WORK="${VM_WORK:-/var/tmp/mlnx-sw-os-vm}"
 
 IMAGE="${IMAGE:-}"                      # the artifact; auto-discovered if empty
-BASE_IMAGE="${BASE_IMAGE:-$VM_WORK/cache/debian-13-generic-amd64.qcow2}"
+# 🔴 ASKED, never rebuilt. This was a hardcoded
+# `$VM_WORK/cache/debian-13-generic-amd64.qcow2`, which broke the moment the
+# base image was pinned to a snapshot and the filename became serial-stamped
+# (`…-20260722-2547.qcow2`). The failure was worse than a missing file: the
+# error said "run: scripts/vm.sh fetch", and fetch creates the STAMPED name, so
+# following the instruction changed nothing and the operator went in a circle.
+# vm.sh owns that name; this asks it. Empty here is fine -- the die at the
+# inspector's use site reports it, and vm.sh's own message names the fix.
+BASE_IMAGE="${BASE_IMAGE:-$("$HERE/vm.sh" base-image 2>/dev/null || true)}"
 
 MEM="${MEM:-2G}"
 CPUS="${CPUS:-2}"
