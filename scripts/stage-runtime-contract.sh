@@ -1217,6 +1217,87 @@ install_dkms_deb() {
 	return 0
 }
 
+# ------------------------------------------------- A5b: protect the rescue kernel
+#
+# 🔴 A kernel WITHOUT mlxsw is a deliberate RESCUE KERNEL (operator ruling,
+# 2026-08-04). Its value is precisely that it lacks the driver: it is what still
+# boots when a DKMS rebuild goes wrong or the ASIC wedges, which is exactly when
+# a shell is needed. It ships on purpose.
+#
+# 🔴 IT DOES NOT SURVIVE ON ITS OWN. It arrives in the base cloud image as a
+# DEPENDENCY of the linux-image-amd64 metapackage, so apt records it
+# Auto-Installed. `apt-get full-upgrade` then repoints that metapackage at the
+# newer kernel and the rescue kernel becomes an ORPHANED auto-installed package.
+# apt 3.0 protects only the running and the previous kernel, so it survives
+# today and is silently autoremoved at the SECOND kernel upgrade -- by
+# unattended-upgrades, which ships ENABLED with Remove-Unused-Kernel-Packages
+# defaulting true. No human action, on a production switch, at the exact moment
+# the fail-safe was being kept for.
+#
+# `apt-mark manual` takes it out of the autoremove set permanently. That is all
+# it does: it does not hold, pin, or protect anything from upgrades.
+#
+# ⚠ Debian carries NO split linux-modules-* package -- verified against
+# dists/trixie/main/binary-amd64/Packages, which lists eighteen linux-image-*
+# and zero linux-modules-*. So linux-image-<ver> holds the kernel AND
+# /lib/modules/<ver>, and marking it manual protects the modules too. This does
+# NOT carry over to Ubuntu, which genuinely does split.
+# The SCAN, kept pure and separate from the apt side so it can be tested
+# against a fixture tree with no shims at all. $1 is a root prefix ("" in
+# production). Prints one rescue-kernel version per line.
+rescue_kernels() { # $1 = root prefix
+	local p="${1-}" k
+	for k in $(ls -1 "$p/lib/modules" 2>/dev/null); do
+		# The SAME predicate boot-test.sh asserts with, reused rather than
+		# reimplemented: two spellings of "does this kernel carry mlxsw"
+		# are two chances to disagree, and the .ko.xz glob is the exact
+		# trap that makes a wrong answer print green.
+		mlxsw_modules_present "$p" "$k" && continue
+		printf '%s\n' "$k"
+	done
+}
+
+mark_rescue_kernels() { # $1 = optional scan prefix (tests only; "" in production)
+	if [ -n "$ROOT" ]; then
+		# Same exit as install_dkms_deb, for the same reason: apt and dpkg
+		# describe a RUNNING system, not a staged tree.
+		inf "ROOT is set: skipping the rescue-kernel apt-mark (apt describes a running system)"
+		return 0
+	fi
+
+	local p="${1-}" k pkg found=0 marked=0
+	for k in $(rescue_kernels "$p"); do
+		found=$((found + 1))
+
+		# 🔴 DERIVE the package name from the file, never build the string
+		# "linux-image-$k". boot-test.sh string-builds it when reading
+		# extended_states; if this side derives it instead, the two
+		# agreeing is EVIDENCE. Both guessing the same way would be one
+		# assumption counted twice.
+		if ! pkg="$(dpkg -S "/boot/vmlinuz-$k" 2>/dev/null | cut -d: -f1)" || [ -z "$pkg" ]; then
+			bad "rescue kernel $k: no package owns /boot/vmlinuz-$k -- cannot protect it from autoremove"
+			continue
+		fi
+		if apt-mark manual "$pkg" >/dev/null 2>&1; then
+			ok "rescue kernel $k is now apt-mark manual ($pkg) -- unattended-upgrades cannot autoremove it"
+			marked=$((marked + 1))
+		else
+			bad "rescue kernel $k: apt-mark manual $pkg failed"
+		fi
+	done
+
+	if [ "$found" = 0 ]; then
+		# Permitted, not required: the ruling keeps a rescue kernel, it
+		# does not mandate one. Say so rather than printing nothing, so a
+		# run that marked nothing is distinguishable from one that never
+		# looked.
+		inf "no rescue kernel present (every shipped kernel carries mlxsw) -- nothing to mark"
+	else
+		inf "$marked of $found rescue kernel(s) protected from autoremove"
+	fi
+	[ "$found" = "$marked" ]
+}
+
 # ------------------------------------------------------------ A6: packages
 check_package_names() {
 	local p v rc=0 missing=""
@@ -1391,6 +1472,11 @@ do_install() {
 	install_packages || true
 	hdr "A5. mlxsw-dkms"
 	install_dkms_deb || true
+	# 🔴 AFTER A5, never before: the rule is stated in terms of which kernels
+	# DKMS built modules for, and DKMS builds them inside A5's apt-get.
+	# Running this first would classify every kernel as a rescue kernel.
+	hdr "A5b. protect the rescue kernel from autoremove"
+	mark_rescue_kernels || true
 	hdr "A7. user model"
 	install_user || true
 	hdr "A8. service enablement"
@@ -2204,6 +2290,114 @@ do_selftest() {
 	mlxsw_modules_present "$W/mod-empty" "$k"    && bad "an empty module dir was read as healthy" || ok "an empty module dir is DETECTED (this IS R4)"
 	mlxsw_modules_present "$W/mod-decoy" "$k"    && bad "a non-mlxsw module was accepted" || ok "non-mlxsw modules only are DETECTED (the glob is mlxsw-specific)"
 	mlxsw_modules_present "$W/nothing" "$k"      && bad "a missing tree was read as healthy" || ok "a missing module tree is DETECTED"
+
+	hdr "S9b the RESCUE KERNEL is protected from autoremove (A5b)"
+	# 🔴 WHY THIS EXISTS: the rescue kernel arrives Auto-Installed as a
+	# dependency of linux-image-amd64. full-upgrade repoints that metapackage
+	# and orphans it; apt 3.0 protects only running+previous, so it survives
+	# today and unattended-upgrades autoremoves it at the SECOND kernel
+	# upgrade. boot-test.sh asserts the mark and has been FAILING on it.
+	local RK="$W/rescue" RESCUE_K="6.12.96+deb13-amd64" GOOD_K="6.12.100+deb13-amd64"
+	mkdir -p "$RK/lib/modules/$RESCUE_K/updates/dkms" "$RK/lib/modules/$GOOD_K/updates/dkms"
+	# Trixie shape deliberately: a '*.ko' glob would classify the GOOD kernel
+	# as a rescue kernel and mark every kernel manual.
+	: > "$RK/lib/modules/$GOOD_K/updates/dkms/mlxsw_spectrum.ko.xz"
+
+	# --- the scan, pure, no shims ------------------------------------------
+	local rk_out
+	rk_out="$(rescue_kernels "$RK")"
+	[ "$rk_out" = "$RESCUE_K" ] \
+		&& ok "the scan names exactly the kernel without mlxsw ($RESCUE_K)" \
+		|| bad "the scan returned [$rk_out], expected [$RESCUE_K]"
+	printf '%s\n' "$rk_out" | grep -qF "$GOOD_K" \
+		&& bad "🔴 the mlxsw-carrying kernel was classified as a rescue kernel (a '*.ko' glob would do this)" \
+		|| ok "🔴 the .ko.xz kernel is NOT called a rescue kernel (the glob handles trixie)"
+	# Positive control for the whole section: with mlxsw present for BOTH,
+	# the scan must go silent. Two "found it" results could otherwise both be
+	# a scan that returns everything it sees.
+	: > "$RK/lib/modules/$RESCUE_K/updates/dkms/mlxsw_spectrum.ko.xz"
+	[ -z "$(rescue_kernels "$RK")" ] \
+		&& ok "positive control: when every kernel carries mlxsw the scan returns nothing" \
+		|| bad "positive control FAILED -- the scan reports rescue kernels that carry mlxsw"
+	rm -f "$RK/lib/modules/$RESCUE_K/updates/dkms/mlxsw_spectrum.ko.xz"
+	[ -z "$(rescue_kernels "$W/nothing")" ] \
+		&& ok "an absent module tree yields no rescue kernels rather than an error" \
+		|| bad "an absent module tree produced output"
+
+	# --- the apt side, by OUTCOME on a shim ledger --------------------------
+	mkdir -p "$W/rkshim"
+	cat > "$W/rkshim/dpkg" <<-SHIM
+	#!/bin/sh
+	echo "dpkg \$*" >> "$W/rk.ledger"
+	# Answer in dpkg -S's real shape: "<pkg>: <path>". The version is
+	# spliced from the PATH so a wrong path yields a wrong package,
+	# rather than a constant that would pass for any input.
+	for a in "\$@"; do case "\$a" in
+	  /boot/vmlinuz-*) echo "linux-image-\${a#/boot/vmlinuz-}: \$a"; exit 0 ;;
+	esac; done
+	exit 1
+	SHIM
+	cat > "$W/rkshim/apt-mark" <<-SHIM
+	#!/bin/sh
+	echo "apt-mark \$*" >> "$W/rk.ledger"
+	exit 0
+	SHIM
+	chmod 0755 "$W/rkshim/dpkg" "$W/rkshim/apt-mark"
+
+	# 🔴 EVERY invocation below goes through $( ), which forks. That is not
+	# style: mark_rescue_kernels calls this file's own ok()/bad(), so running
+	# it in-process adds ITS pass/fail counts to the harness's. The first
+	# draft did exactly that and the orphan case below incremented `fail`
+	# while its message went to a >/dev/null -- a tally reporting "1 failed"
+	# with no FAIL line anywhere in the output. A subshell contains both.
+	rm -f "$W/rk.ledger"
+	local rk_rc=0 rk_out
+	rk_out="$(PATH="$W/rkshim:$PATH" ROOT="" mark_rescue_kernels "$RK" 2>&1)" || rk_rc=$?
+	[ "$rk_rc" = 0 ] && ok "A5b succeeds when every rescue kernel is marked" \
+	                 || bad "A5b returned $rk_rc on a tree it should have handled: $rk_out"
+	grep -qx "apt-mark manual linux-image-$RESCUE_K" "$W/rk.ledger" 2>/dev/null \
+		&& ok "apt-mark manual was called for the rescue kernel, by the name dpkg -S returned" \
+		|| bad "apt-mark manual linux-image-$RESCUE_K never reached the ledger"
+	grep -q "apt-mark manual linux-image-$GOOD_K" "$W/rk.ledger" 2>/dev/null \
+		&& bad "🔴 the mlxsw-carrying kernel was ALSO marked manual -- that pins the working kernel forever" \
+		|| ok "🔴 only the rescue kernel is marked; the mlxsw kernel is left auto"
+	grep -q "dpkg -S /boot/vmlinuz-$RESCUE_K" "$W/rk.ledger" 2>/dev/null \
+		&& ok "the package name is DERIVED from the file, not string-built as linux-image-\$k" \
+		|| bad "no dpkg -S lookup happened -- the package name was guessed"
+
+	# 🔴 ROOT set: not one apt or dpkg call may escape, proven by an EMPTY
+	# ledger. Same discipline as S10's guard shims.
+	rm -f "$W/rk.ledger"
+	local root_out
+	root_out="$(PATH="$W/rkshim:$PATH" ROOT="$W/fakeroot-rk" mark_rescue_kernels "$RK" 2>&1 || true)"
+	[ -e "$W/rk.ledger" ] \
+		&& bad "under --root, A5b still shelled out to apt/dpkg: $(cat "$W/rk.ledger")" \
+		|| ok "under --root, A5b calls neither apt-mark nor dpkg (proven by an empty ledger)"
+	# 🔴 An empty ledger is ALSO what a function that never ran produces. This
+	# separates "took the ROOT branch" from "was never invoked" -- without it
+	# the assertion above would pass for a typo in the call itself.
+	printf '%s\n' "$root_out" | grep -q 'ROOT is set' \
+		&& ok "and it says so, which is how we know the branch ran at all (not a vacuous empty ledger)" \
+		|| bad "the ROOT branch produced no message -- the empty ledger above proves nothing"
+
+	# A kernel no package owns must FAIL loudly, not be skipped silently: an
+	# unprotected rescue kernel that reports success is the original defect.
+	rm -f "$W/rk.ledger"
+	mkdir -p "$W/rk-orphan/lib/modules/9.9.9-orphan/updates/dkms"
+	cat > "$W/rkshim/dpkg" <<-SHIM
+	#!/bin/sh
+	echo "dpkg \$*" >> "$W/rk.ledger"
+	exit 1
+	SHIM
+	chmod 0755 "$W/rkshim/dpkg"
+	rk_rc=0
+	rk_out="$(PATH="$W/rkshim:$PATH" ROOT="" mark_rescue_kernels "$W/rk-orphan" 2>&1)" || rk_rc=$?
+	[ "$rk_rc" != 0 ] \
+		&& ok "a rescue kernel no package owns makes A5b FAIL rather than silently skip it" \
+		|| bad "an unprotectable rescue kernel was reported as success"
+	printf '%s\n' "$rk_out" | grep -q 'no package owns' \
+		&& ok "and it names the kernel it could not protect, rather than failing mutely" \
+		|| bad "the unprotectable rescue kernel is not named in the output"
 
 	hdr "S10  a full offline install into a scratch root"
 	local FR="$W/fakeroot"
